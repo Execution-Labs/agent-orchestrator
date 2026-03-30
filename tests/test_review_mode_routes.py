@@ -95,6 +95,18 @@ def _mock_subprocess_run_gitlab(cmd: list[str], **kwargs: Any) -> Any:
         })
     elif cmd[0] == "glab" and cmd[1:3] == ["mr", "diff"]:
         r.stdout = "diff --git a/g.py b/g.py\n+world\n"
+    elif cmd[0] == "glab" and cmd[1] == "api":
+        r.stdout = json.dumps([
+            {
+                "id": 101,
+                "body": "Please add coverage",
+                "author": {"username": "reviewer1"},
+                "created_at": "2026-01-03T00:00:00Z",
+                "system": False,
+                "resolved": False,
+                "position": None,
+            },
+        ])
     elif cmd[0] == "git" and "diff" in cmd:
         r.stdout = " g.py | 1 +\n 1 file changed\n"
     return r
@@ -339,32 +351,54 @@ class TestCommentFetching:
 # ---------------------------------------------------------------------------
 
 
-class TestGitLabModeRestriction:
-    """GitLab only supports fix_only mode."""
+class TestGitLabModes:
+    """GitLab supports the same review modes through MR-specific task types."""
 
-    def test_gitlab_fix_only_succeeds(self, tmp_path: Path):
+    @pytest.mark.parametrize("mode,expected_task_type,expected_pipeline_id", [
+        ("fix_only", "mr_review", "mr_review"),
+        ("review_comment", "mr_review_comment", "mr_review_comment"),
+        ("summarize", "mr_review_summarize", "mr_review_summarize"),
+        ("fix_respond", "mr_review_fix_respond", "mr_review_fix_respond"),
+    ])
+    def test_gitlab_mode_creates_correct_task_type_and_pipeline(
+        self, tmp_path: Path, mode: str, expected_task_type: str, expected_pipeline_id: str,
+    ):
+        client, container = _client_and_container(tmp_path)
+        registry = PipelineRegistry()
+        expected_steps = registry.get(expected_pipeline_id).step_names()
+        with (
+            patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.runtime.api.routes_tasks.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
+            patch("overdrive.comments.reader.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.comments.reader.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
+        ):
+            resp = client.post("/api/pull-requests/15/review", json={"review_mode": mode})
+
+        assert resp.status_code == 200
+        task_data = resp.json()["task"]
+        assert task_data["task_type"] == expected_task_type
+
+        stored = container.tasks.get(task_data["id"])
+        assert stored is not None
+        assert stored.pipeline_template == expected_steps
+
+    @pytest.mark.parametrize("mode", sorted(_MODES_NEEDING_COMMENTS))
+    def test_gitlab_comment_modes_store_source_comments(self, tmp_path: Path, mode: str):
         client, container = _client_and_container(tmp_path)
         with (
             patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/glab"),
             patch("overdrive.runtime.api.routes_tasks.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
-        ):
-            resp = client.post("/api/pull-requests/15/review", json={"review_mode": "fix_only"})
-
-        assert resp.status_code == 200
-        task_data = resp.json()["task"]
-        assert task_data["task_type"] == "mr_review"
-
-    @pytest.mark.parametrize("mode", ["review_comment", "summarize", "fix_respond"])
-    def test_gitlab_non_fix_only_returns_400(self, tmp_path: Path, mode: str):
-        client, _ = _client_and_container(tmp_path)
-        with (
-            patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/glab"),
-            patch("overdrive.runtime.api.routes_tasks.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
+            patch("overdrive.comments.reader.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.comments.reader.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
         ):
             resp = client.post("/api/pull-requests/15/review", json={"review_mode": mode})
 
-        assert resp.status_code == 400
-        assert "not yet supported" in resp.json()["detail"]
+        assert resp.status_code == 200
+        stored = container.tasks.get(resp.json()["task"]["id"])
+        assert stored is not None
+        assert isinstance(stored.metadata, dict)
+        assert "source_comments" in stored.metadata
+        assert "source_comments_formatted" in stored.metadata
 
 
 # ---------------------------------------------------------------------------

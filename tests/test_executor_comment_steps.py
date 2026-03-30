@@ -636,6 +636,31 @@ class TestExecutePostCommentResponses:
         assert result == "ok"
         assert task.metadata["posted_responses"][0]["post_status"] == "posted"
 
+    @patch("overdrive.runtime.orchestrator.task_executor.post_comments_batch")
+    def test_gitlab_reply_uses_discussion_id_when_available(self, mock_batch: MagicMock) -> None:
+        mock_batch.return_value = [CommentPostResult(success=True, platform_id="3001")]
+        executor, _svc = self._make_executor()
+        worker_output = json.dumps({
+            "addressed_comments": [
+                {"original_comment_id": "comment-0", "response_body": "Fixed"},
+            ],
+        })
+        task = _make_task({
+            "comment_platform": {"platform": "gitlab", "project_id": "g%2Fr", "number": 5},
+            "step_outputs": {"pr_review_fix_respond": worker_output},
+            "fetched_comments": [{"id": "comment-0", "platform_id": "100", "discussion_id": "discussion-abc"}],
+            "comment_dry_run": False,
+        })
+        run = _make_run()
+
+        result = executor._execute_post_comment_responses(task, run)
+
+        assert result == "ok"
+        call_args = mock_batch.call_args
+        posted_comments = call_args[0][1]
+        assert posted_comments[0]["discussion_id"] == "discussion-abc"
+        assert posted_comments[0]["in_reply_to"] == 100
+
     def test_missing_original_comment_posts_as_top_level(self) -> None:
         executor, svc = self._make_executor()
         worker_output = json.dumps({

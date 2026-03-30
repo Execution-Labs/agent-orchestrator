@@ -7600,15 +7600,14 @@ export default function App() {
     const platformLabel = platform === 'gitlab' ? 'GitLab' : 'GitHub'
     const cliName = platform === 'gitlab' ? 'glab' : 'gh'
     const prLabel = platform === 'gitlab' ? 'merge requests' : 'pull requests'
-
     if (errorCode === 'no_remote' || !platform) {
       return (
         <div className="pr-review-setup-help">
           <p className="pr-review-setup-help-title">Set up a git remote</p>
-          <p>This project does not appear to have a GitHub or GitLab remote configured. To use {prLabel} features, connect your repository:</p>
+          <p>This project does not appear to have a GitHub or GitLab remote configured. To use review features, connect your repository:</p>
           <ol className="pr-review-setup-steps">
             <li><span className="pr-review-step-label">Check your current remotes:</span><pre>git remote -v</pre></li>
-            <li><span className="pr-review-step-label">Add a remote if none exists:</span><pre>git remote add origin https://github.com/your-org/your-repo.git</pre></li>
+            <li><span className="pr-review-step-label">Add a remote if none exists:</span><pre>git remote add origin https://gitlab.com/your-group/your-repo.git{'\n'}# or: git remote add origin https://github.com/your-org/your-repo.git</pre></li>
             <li><span className="pr-review-step-label">Verify the remote is configured:</span><pre>git remote -v</pre></li>
           </ol>
         </div>
@@ -8139,7 +8138,7 @@ export default function App() {
                       ))}
                     </div>
                   ) : null}
-                  {prListLoading ? <p className="text-muted">Loading open pull requests…</p> : null}
+                  {prListLoading ? <p className="text-muted">Loading open {prPlatform === 'gitlab' ? 'merge requests' : 'pull requests'}…</p> : null}
                   {prListError ? (
                     <div className="pr-review-setup">
                       <p className="pr-review-setup-error">{prListError}</p>
@@ -8150,7 +8149,7 @@ export default function App() {
                     <p className="text-muted">No open {prPlatform === 'gitlab' ? 'merge requests' : 'pull requests'} found.</p>
                   ) : null}
                   {!prListLoading && prList.length > 0 ? (
-                    <div className="pr-review-list" role="radiogroup" aria-label="Open pull requests">
+                    <div className="pr-review-list" role="radiogroup" aria-label={`Open ${prPlatform === 'gitlab' ? 'merge requests' : 'pull requests'}`}>
                       {prList.map((pr) => (
                         <button
                           key={pr.number}
@@ -8167,7 +8166,7 @@ export default function App() {
                             <span className="pr-review-author">{pr.author}</span>
                             <span className="pr-review-branches">{pr.base_ref} ← {pr.head_ref}</span>
                           </span>
-                          {pr.has_review_task ? <span className="pr-review-badge">Review exists</span> : null}
+                          {pr.has_review_task ? <span className="pr-review-badge">{prPlatform === 'gitlab' ? 'MR review exists' : 'PR review exists'}</span> : null}
                         </button>
                       ))}
                     </div>

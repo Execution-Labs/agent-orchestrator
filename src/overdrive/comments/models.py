@@ -33,6 +33,7 @@ class PRComment:
     resolved: bool = False
     in_reply_to: Optional[str] = None
     platform_id: str = ""
+    discussion_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the comment to a plain dictionary.
@@ -68,6 +69,7 @@ class PRComment:
             resolved=bool(data.get("resolved", False)),
             in_reply_to=(str(data.get("in_reply_to")) if data.get("in_reply_to") is not None else None),
             platform_id=str(data.get("platform_id") or ""),
+            discussion_id=(str(data.get("discussion_id")) if data.get("discussion_id") is not None else None),
         )
 
 

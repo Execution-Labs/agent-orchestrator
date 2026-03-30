@@ -80,13 +80,25 @@ class CreatePullRequestReviewRequest(BaseModel):
 # Review mode → pipeline mapping
 # ---------------------------------------------------------------------------
 
-_REVIEW_MODE_TO_PIPELINE: dict[str, tuple[str, str]] = {
+_REVIEW_MODE_TO_PIPELINE_GITHUB: dict[str, tuple[str, str]] = {
     # review_mode → (task_type, pipeline_id)
     "fix_only": ("pr_review_fix_only", "pr_review_fix_only"),
     "review_comment": ("pr_review_comment", "pr_review_comment"),
     "summarize": ("pr_review_summarize", "pr_review_summarize"),
     "fix_respond": ("pr_review_fix_respond", "pr_review_fix_respond"),
 }
+
+_REVIEW_MODE_TO_PIPELINE_GITLAB: dict[str, tuple[str, str]] = {
+    # review_mode → (task_type, pipeline_id)
+    "fix_only": ("mr_review", "mr_review"),
+    "review_comment": ("mr_review_comment", "mr_review_comment"),
+    "summarize": ("mr_review_summarize", "mr_review_summarize"),
+    "fix_respond": ("mr_review_fix_respond", "mr_review_fix_respond"),
+}
+
+# Backward-compatible alias retained for tests and existing imports. This maps
+# review modes to the GitHub/default task types.
+_REVIEW_MODE_TO_PIPELINE = _REVIEW_MODE_TO_PIPELINE_GITHUB
 
 _MODES_NEEDING_COMMENTS: set[str] = {"review_comment", "summarize", "fix_respond"}
 
@@ -1147,8 +1159,8 @@ def _fetch_gitlab_mr_context(
     Args:
         git_dir: Path to the git repository.
         mr_number: GitLab merge request number.
-        fetch_comments: When True, include an empty ``comments`` list (GitLab
-            comment fetching for non-fix_only modes is not yet implemented).
+        fetch_comments: When True, also fetch MR comments and include both raw
+            and formatted comment context.
 
     Returns:
         A dict with keys: title, body, head_ref, base_ref, url, diff, stat,
@@ -1207,8 +1219,33 @@ def _fetch_gitlab_mr_context(
     }
 
     if fetch_comments:
-        # GitLab comment fetching for non-fix_only modes is not yet implemented.
-        result["comments"] = []
+        from ...comments.formatter import format_comments_for_prompt
+        from ...comments.reader import CommentFetchError, fetch_mr_comments
+        from ...comments.writer import parse_source_url
+
+        try:
+            project_id = str(parse_source_url(url)["project_id"])
+        except (ValueError, KeyError, TypeError):
+            project_id = ""
+
+        result["project_id"] = project_id
+        if project_id:
+            try:
+                comments = fetch_mr_comments(project_id, mr_number, cwd=git_dir)
+            except CommentFetchError:
+                comments = []
+            result["comments"] = [c.to_dict() for c in comments]
+            result["comments_formatted"] = format_comments_for_prompt(comments)
+        else:
+            result["comments"] = []
+            result["comments_formatted"] = ""
+    elif url:
+        try:
+            from ...comments.writer import parse_source_url
+
+            result["project_id"] = str(parse_source_url(url)["project_id"])
+        except (ValueError, KeyError, TypeError):
+            pass
 
     return result
 
@@ -3536,6 +3573,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
                 "source_url": ctx["url"],
                 "source_ref": ctx["head_ref"],
                 "source_base_ref": ctx["base_ref"],
+                "source_project_id": ctx.get("project_id", ""),
             },
         )
         container.tasks.upsert(review_task)
@@ -3765,15 +3803,9 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         # Resolve task_type and pipeline_id from the selected review mode.
         if platform == "gitlab":
-            if body.review_mode != "fix_only":
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Review mode '{body.review_mode}' is not yet supported for GitLab merge requests. Only 'fix_only' is available.",
-                )
-            task_type_key = "mr_review"
-            pipeline_id = "mr_review"
+            task_type_key, pipeline_id = _REVIEW_MODE_TO_PIPELINE_GITLAB[body.review_mode]
         else:
-            task_type_key, pipeline_id = _REVIEW_MODE_TO_PIPELINE[body.review_mode]
+            task_type_key, pipeline_id = _REVIEW_MODE_TO_PIPELINE_GITHUB[body.review_mode]
 
         meta_number_key = "source_pr_number" if platform == "github" else "source_mr_number"
 
@@ -3811,10 +3843,13 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
             "comment_dry_run": True,
             "final_pipeline_id": pipeline_id,
         }
+        if platform == "gitlab" and ctx.get("project_id"):
+            metadata["source_project_id"] = ctx["project_id"]
         if body.guidance:
             metadata["review_guidance"] = body.guidance
         if needs_comments and ctx.get("comments") is not None:
             metadata["source_comments"] = ctx["comments"]
+            metadata["source_comments_formatted"] = str(ctx.get("comments_formatted") or "")
 
         if platform == "github":
             title = f"PR Review: #{number} — {ctx['title']}" if ctx["title"] else f"PR Review: #{number}"

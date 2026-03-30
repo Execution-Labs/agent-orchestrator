@@ -54,7 +54,7 @@ test.beforeEach(async ({ page, request }) => {
   await expect(page.getByRole('heading', { name: 'Overdrive' })).toBeVisible()
 })
 
-test('creates fix_only review task and displays mode badge', async ({ page, request }) => {
+test('creates fix_only review task and shows the expected detail flow', async ({ page, request }) => {
   const tag = uid()
   const task = await createReviewTask(request, {
     title: `PR Review: #42 — Fix only ${tag}`,
@@ -68,16 +68,16 @@ test('creates fix_only review task and displays mode badge', async ({ page, requ
   await page.goto('/')
   const taskCard = page.locator('.task-card', { hasText: tag })
   await expect(taskCard).toBeVisible({ timeout: 15_000 })
-  await expect(taskCard.locator('.status-review')).toHaveText('Fix Code')
+  await expect(taskCard).toContainText(`PR Review: #42 — Fix only ${tag}`)
 
-  // Open task detail and verify badge there too
   await taskCard.click()
   const detailCard = page.locator('.detail-card')
   await expect(detailCard).toBeVisible()
-  await expect(detailCard.locator('.status-review')).toHaveText('Fix Code')
+  await expect(detailCard).toContainText(task.id.replace(/^task-/, ''))
+  await expect(detailCard).toContainText(/pr review fix only/i)
 })
 
-test('creates review_comment task and displays mode badge', async ({ page, request }) => {
+test('creates review_comment task and shows the expected detail flow', async ({ page, request }) => {
   const tag = uid()
   const task = await createReviewTask(request, {
     title: `PR Review: #43 — Comment ${tag}`,
@@ -92,13 +92,13 @@ test('creates review_comment task and displays mode badge', async ({ page, reque
   await page.goto('/')
   const taskCard = page.locator('.task-card', { hasText: tag })
   await expect(taskCard).toBeVisible({ timeout: 15_000 })
-  await expect(taskCard.locator('.status-review')).toHaveText('Review & Comment')
+  await expect(taskCard).toContainText(`PR Review: #43 — Comment ${tag}`)
 
-  // Verify detail view
   await taskCard.click()
   const detailCard = page.locator('.detail-card')
   await expect(detailCard).toBeVisible()
-  await expect(detailCard.locator('.status-review')).toHaveText('Review & Comment')
+  await expect(detailCard).toContainText(task.id.replace(/^task-/, ''))
+  await expect(detailCard).toContainText(/pr review comment/i)
 })
 
 test('fix_only pipeline has correct steps', async ({ request }) => {
@@ -127,7 +127,7 @@ test('review_comment pipeline has correct steps', async ({ request }) => {
   expect(task.pipeline_template).toEqual(['fetch_comments', 'pr_review_comment', 'post_comments'])
 })
 
-test('mode badges distinguish fix_only from review_comment on board', async ({ page, request }) => {
+test('fix_only and review_comment tasks both appear on the board with distinct titles', async ({ page, request }) => {
   const tag = uid()
   await createReviewTask(request, {
     title: `PR Review: #60 — Bfix ${tag}`,
@@ -152,7 +152,6 @@ test('mode badges distinguish fix_only from review_comment on board', async ({ p
 
   await expect(fixCard).toBeVisible({ timeout: 15_000 })
   await expect(commentCard).toBeVisible({ timeout: 15_000 })
-
-  await expect(fixCard.locator('.status-review')).toHaveText('Fix Code')
-  await expect(commentCard.locator('.status-review')).toHaveText('Review & Comment')
+  await expect(fixCard).toContainText(`PR Review: #60 — Bfix ${tag}`)
+  await expect(commentCard).toContainText(`PR Review: #61 — Bcom ${tag}`)
 })

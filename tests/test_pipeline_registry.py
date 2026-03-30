@@ -17,8 +17,9 @@ class TestPipelineTemplate:
             "feature", "bug_fix", "refactor", "research", "docs",
             "test", "repo_review", "security_audit", "review", "commit_review",
             "pr_review", "mr_review",
-            "pr_review_comment", "pr_review_summarize",
-            "pr_review_fix_only", "pr_review_fix_respond",
+            "pr_review_comment", "mr_review_comment",
+            "pr_review_summarize", "mr_review_summarize",
+            "pr_review_fix_only", "pr_review_fix_respond", "mr_review_fix_respond",
             "performance", "hotfix", "spike", "chore", "plan_only", "verify_only",
         }
         assert expected == set(BUILTIN_TEMPLATES.keys())
@@ -90,6 +91,18 @@ class TestPipelineTemplate:
         assert tmpl.step_names() == ["fetch_comments", "pr_review_summarize"]
         assert tmpl.task_types == ("pr_review_summarize",)
 
+    def test_mr_review_comment_pipeline_steps(self):
+        """Test that MR review comment pipeline has fetch, review, post sequence."""
+        tmpl = BUILTIN_TEMPLATES["mr_review_comment"]
+        assert tmpl.step_names() == ["fetch_comments", "pr_review_comment", "post_comments"]
+        assert tmpl.task_types == ("mr_review_comment",)
+
+    def test_mr_review_summarize_pipeline_steps(self):
+        """Test that MR review summarize pipeline has fetch and summarize steps."""
+        tmpl = BUILTIN_TEMPLATES["mr_review_summarize"]
+        assert tmpl.step_names() == ["fetch_comments", "pr_review_summarize"]
+        assert tmpl.task_types == ("mr_review_summarize",)
+
     def test_pr_review_fix_only_pipeline_steps(self):
         """Test that PR review fix-only pipeline matches the fix_only step sequence."""
         tmpl = BUILTIN_TEMPLATES["pr_review_fix_only"]
@@ -105,6 +118,16 @@ class TestPipelineTemplate:
             "verify", "review", "post_comment_responses", "commit",
         ]
         assert tmpl.task_types == ("pr_review_fix_respond",)
+        assert tmpl.metadata.get("supports_skip_to_precommit") is True
+
+    def test_mr_review_fix_respond_pipeline_steps(self):
+        """Test that MR review fix-and-respond pipeline has the full 7-step sequence."""
+        tmpl = BUILTIN_TEMPLATES["mr_review_fix_respond"]
+        assert tmpl.step_names() == [
+            "fetch_comments", "pr_review_fix_respond", "implement",
+            "verify", "review", "post_comment_responses", "commit",
+        ]
+        assert tmpl.task_types == ("mr_review_fix_respond",)
         assert tmpl.metadata.get("supports_skip_to_precommit") is True
 
     def test_pr_review_alias_matches_fix_only(self):
@@ -149,7 +172,7 @@ class TestPipelineRegistry:
         """Test that list templates."""
         reg = PipelineRegistry()
         templates = reg.list_templates()
-        assert len(templates) == 22
+        assert len(templates) == 25
 
     def test_get_template(self):
         """Test that get template."""

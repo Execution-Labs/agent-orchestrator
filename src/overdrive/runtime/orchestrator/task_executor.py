@@ -388,6 +388,7 @@ class TaskExecutor:
         formatted_text = format_comments_for_prompt(comments)
         task.metadata["fetched_comments"] = [c.to_dict() for c in comments]
         task.metadata["formatted_comments"] = formatted_text
+        task.metadata["source_comments_formatted"] = formatted_text
         task.metadata["comment_platform"] = platform_info
         svc.container.tasks.upsert(task)
 
@@ -648,15 +649,19 @@ class TaskExecutor:
             svc._emit_task_blocked(task)
             return "blocked"
 
-        # Build lookup from internal comment ID to platform_id.
+        # Build lookup from internal comment ID to platform/discussion IDs.
         fetched_comments = meta.get("fetched_comments") or []
-        id_to_platform: dict[str, str] = {}
+        id_to_reply_target: dict[str, dict[str, str]] = {}
         for fc in fetched_comments:
             if isinstance(fc, dict):
                 cid = str(fc.get("id") or "")
                 pid = str(fc.get("platform_id") or "")
-                if cid and pid:
-                    id_to_platform[cid] = pid
+                discussion_id = str(fc.get("discussion_id") or "")
+                if cid and (pid or discussion_id):
+                    id_to_reply_target[cid] = {
+                        "platform_id": pid,
+                        "discussion_id": discussion_id,
+                    }
 
         dry_run = bool(meta.get("comment_dry_run", True))
         git_dir = svc.step_project_dir(task)
@@ -675,10 +680,12 @@ class TaskExecutor:
                 skipped_count += 1
                 continue
 
-            platform_id = id_to_platform.get(original_id, "")
-            if not platform_id:
+            reply_target = id_to_reply_target.get(original_id, {})
+            platform_id = str(reply_target.get("platform_id") or "")
+            discussion_id = str(reply_target.get("discussion_id") or "")
+            if not platform_id and not discussion_id:
                 logger.warning(
-                    "post_comment_responses: no platform_id for comment %s in task %s, posting as top-level",
+                    "post_comment_responses: no reply target for comment %s in task %s, posting as top-level",
                     original_id, task.id,
                 )
 
@@ -699,6 +706,8 @@ class TaskExecutor:
                 "body": response_body,
                 "in_reply_to": reply_to,
             }
+            if discussion_id:
+                comment_data["discussion_id"] = discussion_id
             batch_results = post_comments_batch(
                 platform_info,
                 [comment_data],

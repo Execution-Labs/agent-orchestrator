@@ -141,6 +141,40 @@ def _run_glab_api_post(
         return False, f"glab api POST OS error: {exc}"
 
 
+def _get_gitlab_mr_head_sha(
+    project_id: str,
+    mr_number: int,
+    *,
+    cwd: Path | None = None,
+) -> str | None:
+    """Fetch the current HEAD SHA for a GitLab merge request."""
+    endpoint = f"projects/{project_id}/merge_requests/{mr_number}"
+    try:
+        result = subprocess.run(
+            ["glab", "api", endpoint, "-X", "GET"],
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+        data = json.loads(result.stdout or "{}")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    sha = str(data.get("sha") or "").strip()
+    if sha:
+        return sha
+    diff_refs = data.get("diff_refs")
+    if isinstance(diff_refs, dict):
+        head_sha = str(diff_refs.get("head_sha") or "").strip()
+        if head_sha:
+            return head_sha
+    return None
+
+
 def _extract_id_from_response(response: str) -> str:
     """Extract the ``id`` field from a JSON API response string."""
     try:
@@ -281,6 +315,7 @@ def post_mr_comment(
     body: str,
     cwd: Path | None = None,
     in_reply_to: int | None = None,
+    discussion_id: str | None = None,
 ) -> CommentPostResult:
     """Post a comment to a GitLab merge request.
 
@@ -296,19 +331,20 @@ def post_mr_comment(
         body: Comment body text.
         cwd: Working directory for ``glab`` CLI context.
         in_reply_to: Platform ID of note to reply to.
+        discussion_id: GitLab discussion ID for threaded replies.
 
     Returns:
         :class:`CommentPostResult` indicating success or failure.
     """
     base = f"projects/{project_id}/merge_requests/{mr_number}"
 
-    if in_reply_to is not None:
-        # Post as a top-level note quoting the original (GitLab's discussion
-        # reply API requires the discussion ID, not the note ID; we don't have
-        # the discussion ID readily available, so we post a new note referencing
-        # the original).
-        endpoint = f"{base}/notes"
+    if discussion_id:
+        endpoint = f"{base}/discussions/{discussion_id}/notes"
         payload: dict[str, Any] = {"body": body}
+    elif in_reply_to is not None:
+        # Fallback when only the original note ID is available.
+        endpoint = f"{base}/notes"
+        payload = {"body": body}
     elif path is not None and line is not None:
         # Inline comment via discussions endpoint.
         endpoint = f"{base}/discussions"
@@ -342,10 +378,12 @@ def post_mr_review_decision(
     body: str,
     cwd: Path | None = None,
 ) -> CommentPostResult:
-    """Post a review decision as a formatted note on a GitLab merge request.
+    """Post a native review decision on a GitLab merge request.
 
-    GitLab has no native review decision API, so the decision is posted as a
-    formatted note (e.g. ``[APPROVED] body``).
+    GitLab exposes merge request review state through quick actions in notes.
+    We use that path instead of synthetic ``[APPROVED]``-style notes so the
+    merge request reflects real approval / requested-changes / reviewed state
+    while still preserving the generated summary text in a single post.
 
     Args:
         project_id: URL-encoded GitLab project path or numeric ID.
@@ -357,18 +395,41 @@ def post_mr_review_decision(
     Returns:
         :class:`CommentPostResult` indicating success or failure.
     """
-    label = decision.upper().replace("_", " ")
-    formatted_body = f"[{label}] {body}" if body else f"[{label}]"
+    command_map: dict[ReviewDecisionType, str] = {
+        "request_changes": "/submit_review requested_changes",
+        "comment": "/submit_review reviewed",
+    }
+    if decision == "approve":
+        payload: dict[str, Any] = {}
+        sha = _get_gitlab_mr_head_sha(project_id, mr_number, cwd=cwd)
+        if sha:
+            payload["sha"] = sha
+        approve_endpoint = f"projects/{project_id}/merge_requests/{mr_number}/approve"
+        ok, response = _run_glab_api_post(approve_endpoint, payload, cwd)
+        if not ok:
+            return CommentPostResult(success=False, error=response)
+        if not body.strip():
+            return CommentPostResult(success=True)
+
+        note_ok, note_response = _run_glab_api_post(
+            f"projects/{project_id}/merge_requests/{mr_number}/notes",
+            {"body": body},
+            cwd,
+        )
+        return CommentPostResult(
+            success=note_ok,
+            platform_id=_extract_id_from_response(note_response) if note_ok else "",
+            error=note_response if not note_ok else None,
+        )
+
+    command = command_map.get(decision, "/submit_review reviewed")
+    formatted_body = f"{body}\n\n{command}" if body else command
     endpoint = f"projects/{project_id}/merge_requests/{mr_number}/notes"
-    payload: dict[str, Any] = {"body": formatted_body}
+    payload = {"body": formatted_body}
 
     ok, response = _run_glab_api_post(endpoint, payload, cwd)
     platform_id = _extract_id_from_response(response) if ok else ""
-    return CommentPostResult(
-        success=ok,
-        platform_id=platform_id,
-        error=response if not ok else None,
-    )
+    return CommentPostResult(success=ok, platform_id=platform_id, error=response if not ok else None)
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +469,7 @@ def post_comments_batch(
         line = int(raw_line) if raw_line is not None and int(raw_line) > 0 else None
         raw_reply = comment.get("in_reply_to")
         in_reply_to = int(raw_reply) if raw_reply is not None else None
+        discussion_id = str(comment.get("discussion_id") or "").strip() or None
 
         # Inline comment requires a valid line; skip if path is set but line
         # is missing/zero (the LLM failed to resolve a diff line number).
@@ -439,6 +501,7 @@ def post_comments_batch(
                 body=body,
                 cwd=git_dir,
                 in_reply_to=in_reply_to,
+                discussion_id=discussion_id,
             )
         else:
             result = CommentPostResult(success=False, error=f"Unsupported platform: {platform}")

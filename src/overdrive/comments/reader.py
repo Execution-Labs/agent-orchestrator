@@ -250,7 +250,7 @@ def _parse_paginated_json_gl(raw: str) -> list[dict]:  # type: ignore[type-arg]
     return merged
 
 
-def _parse_note(note: dict) -> PRComment:  # type: ignore[type-arg]
+def _parse_note(note: dict, *, discussion_id: str | None = None) -> PRComment:  # type: ignore[type-arg]
     """Convert a single GitLab note dict into a :class:`PRComment`."""
     position = note.get("position")
     path: str | None = None
@@ -273,7 +273,78 @@ def _parse_note(note: dict) -> PRComment:  # type: ignore[type-arg]
         path=path,
         line=line,
         in_reply_to=None,
+        discussion_id=discussion_id or (str(note.get("discussion_id")) if note.get("discussion_id") is not None else None),
     )
+
+
+def _run_glab_api_paginated(endpoint: str, *, cwd: Path | None = None) -> list[dict[str, Any]]:
+    """Run ``glab api --paginate`` and parse the JSON array response."""
+    try:
+        result = subprocess.run(
+            ["glab", "api", "--paginate", endpoint, "-X", "GET"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise CommentFetchError(f"glab api failed: {exc.stderr}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CommentFetchError("glab api timed out") from exc
+    return _parse_paginated_json_gl(result.stdout)
+
+
+def _discussion_note_map(discussions: list[dict[str, Any]]) -> dict[str, str]:
+    """Build a note-id -> discussion-id lookup from GitLab discussions payload."""
+    out: dict[str, str] = {}
+    for discussion in discussions:
+        if not isinstance(discussion, dict):
+            continue
+        raw_discussion_id = discussion.get("id")
+        discussion_id = str(raw_discussion_id) if raw_discussion_id is not None else ""
+        if not discussion_id:
+            continue
+        notes = discussion.get("notes")
+        if not isinstance(notes, list):
+            continue
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            note_id = note.get("id")
+            if note_id is None:
+                continue
+            out[str(note_id)] = discussion_id
+    return out
+
+
+def _parse_discussion_comments(discussions: list[dict[str, Any]]) -> list[PRComment]:
+    """Convert GitLab discussions payload into unified comment objects."""
+    comments: list[PRComment] = []
+    for discussion in discussions:
+        if not isinstance(discussion, dict):
+            continue
+        discussion_id = str(discussion.get("id") or "").strip() or None
+        notes = discussion.get("notes")
+        if not isinstance(notes, list):
+            continue
+        root_platform_id: str | None = None
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            if note.get("system", False):
+                continue
+            try:
+                comment = _parse_note(note, discussion_id=discussion_id)
+            except (KeyError, TypeError) as exc:
+                logger.warning("Skipping malformed discussion note %s: %s", note.get("id"), exc)
+                continue
+            if root_platform_id:
+                comment.in_reply_to = root_platform_id
+            else:
+                root_platform_id = comment.platform_id
+            comments.append(comment)
+    return comments
 
 
 def fetch_mr_comments(
@@ -303,41 +374,45 @@ def fetch_mr_comments(
     if shutil.which("glab") is None:
         raise CommentFetchError("glab CLI is not installed")
 
-    cmd = [
-        "glab",
-        "api",
-        "--paginate",
-        f"projects/{project_id}/merge_requests/{mr_number}/notes",
-        "-X",
-        "GET",
-    ]
+    discussions_endpoint = f"projects/{project_id}/merge_requests/{mr_number}/discussions"
+    notes_endpoint = f"projects/{project_id}/merge_requests/{mr_number}/notes"
 
+    discussions: list[dict[str, Any]] = []
+    notes: list[dict[str, Any]] = []
+    discussions_error: CommentFetchError | None = None
+    notes_error: CommentFetchError | None = None
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=60,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise CommentFetchError(f"glab api failed: {exc.stderr}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise CommentFetchError("glab api timed out") from exc
+        discussions = _run_glab_api_paginated(discussions_endpoint, cwd=cwd)
+    except CommentFetchError as exc:
+        discussions_error = exc
+    try:
+        notes = _run_glab_api_paginated(notes_endpoint, cwd=cwd)
+    except CommentFetchError as exc:
+        notes_error = exc
 
-    notes = _parse_paginated_json_gl(result.stdout)
+    if discussions_error is not None and notes_error is not None and not discussions and not notes:
+        raise discussions_error or notes_error or CommentFetchError("glab api failed")
 
-    comments: list[PRComment] = []
+    comments_by_platform: dict[str, PRComment] = {}
+
+    for comment in _parse_discussion_comments(discussions):
+        comments_by_platform[comment.platform_id] = comment
+
+    discussion_lookup = _discussion_note_map(discussions)
     for note in notes:
         if not isinstance(note, dict):
             continue
         if note.get("system", False):
             continue
         try:
-            comments.append(_parse_note(note))
+            note_id = str(note.get("id")) if note.get("id") is not None else ""
+            if note_id and note_id in comments_by_platform:
+                continue
+            comment = _parse_note(note, discussion_id=discussion_lookup.get(note_id))
+            comments_by_platform[comment.platform_id] = comment
         except (KeyError, TypeError) as exc:
             logger.warning("Skipping malformed note %s: %s", note.get("id"), exc)
 
+    comments = list(comments_by_platform.values())
     comments.sort(key=lambda c: c.created_at)
     return comments
