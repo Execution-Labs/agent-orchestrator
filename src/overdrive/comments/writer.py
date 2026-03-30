@@ -122,6 +122,7 @@ def _run_glab_api_post(
             [
                 "glab", "api",
                 "-X", "POST",
+                "-H", "Content-Type: application/json",
                 "--input", "-",
                 endpoint,
             ],
