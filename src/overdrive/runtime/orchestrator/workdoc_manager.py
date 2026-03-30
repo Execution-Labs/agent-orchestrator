@@ -35,13 +35,13 @@ class WorkdocManager:
         "verify": ("## Verification Results", "verify"),
         "benchmark": ("## Verification Results", "verify"),
         "report": ("## Final Report", "report"),
-        # PR review pipelines
-        "fetch_comments": ("## Fetched Comments", "fetch_comments"),
-        "pr_review_comment": ("## Review Comments", "pr_review_comment"),
-        "pr_review_summarize": ("## Review Summary", "pr_review_summarize"),
-        "pr_review_fix_respond": ("## Review & Fix Plan", "pr_review_fix_respond"),
-        "post_comments": ("## Posted Comments", "post_comments"),
-        "post_comment_responses": ("## Comment Responses", "post_comment_responses"),
+        # PR/MR review pipelines use human-readable placeholder text.
+        "fetch_comments": ("## Fetched Comments", "fetch comments"),
+        "pr_review_comment": ("## Review Comments", "review & comment"),
+        "pr_review_summarize": ("## Review Summary", "summarize"),
+        "pr_review_fix_respond": ("## Review & Fix Plan", "review & plan fixes"),
+        "post_comments": ("## Posted Comments", "post comments"),
+        "post_comment_responses": ("## Comment Responses", "post comment responses"),
     }
     _WORKDOC_SENTINEL_ID_MAP: dict[str, str] = {
         "plan": "plan",

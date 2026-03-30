@@ -568,6 +568,33 @@ def test_sync_fallback_writes_analyze_to_analysis_section(
     assert "_Pending: will be populated by the analyze step._" not in content
 
 
+def test_sync_fallback_writes_fetch_comments_into_review_summarize_workdoc(
+    service: OrchestratorService, project_dir: Path
+) -> None:
+    """Fetched-comments placeholder text should be replaced for summarize mode."""
+    task = Task(
+        title="Summarize MR",
+        description="Summarize review state",
+        task_type="pr_review_summarize",
+        priority="P2",
+    )
+    task.pipeline_template = ["fetch_comments", "pr_review_summarize"]
+    service._init_workdoc(task, project_dir)
+
+    service._sync_workdoc(task, "fetch_comments", project_dir, "Fetched **2** comment(s) from github.\n\n## General\n[@alice, 2026-03-30] (unresolved)\nNeeds tests")
+
+    canonical = service._workdoc_canonical_path(task.id)
+    content = canonical.read_text()
+    assert "Fetched **2** comment(s) from github." in content
+    assert "_Pending: will be populated by the fetch comments step._" not in content
+
+    service._sync_workdoc(task, "pr_review_summarize", project_dir, "### Change Overview\n\nSummary body")
+
+    content = canonical.read_text()
+    assert "### Change Overview" in content
+    assert "_Pending: will be populated by the summarize step._" not in content
+
+
 def test_sync_fallback_appends_under_existing_content(service: OrchestratorService, task: Task, project_dir: Path) -> None:
     """When placeholder is already replaced, summary appends under the heading."""
     service._init_workdoc(task, project_dir)

@@ -22,7 +22,7 @@ If the diff was truncated (indicated by a `[DIFF TRUNCATED]` notice), consult th
 
 ## Output
 
-Write your summary into the workdoc's **## Plan** section (which already exists — do not repeat the heading) using this structure:
+Write your summary into the workdoc's **## Review Summary** section (which already exists — do not repeat the heading) using this structure:
 
 ```
 ### Change Overview
