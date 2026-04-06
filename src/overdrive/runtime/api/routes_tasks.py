@@ -3954,6 +3954,8 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
             platform_info,
             generated_comments,
             git_dir=git_dir,
+            source_diff=str(meta.get("source_diff") or ""),
+            gitlab_diff_refs=meta.get("source_diff_refs") if isinstance(meta.get("source_diff_refs"), dict) else None,
         )
 
         results: list[dict[str, Any]] = []

@@ -146,6 +146,43 @@ class TestPostReviewComments:
         assert updated.metadata["posted_comments"][0]["success"] is True
         assert updated.metadata["posted_comments"][1]["success"] is False
 
+    def test_gitlab_posting_passes_diff_context(self, tmp_path: Path) -> None:
+        client, container = _client_and_container(tmp_path)
+        task = _create_task(
+            container,
+            title="Review MR",
+            task_type="mr_review_comment",
+            status="done",
+            metadata={
+                "comment_dry_run": True,
+                "generated_review_comments": [
+                    {"path": "src/example.py", "line": 10, "body": "Inline issue", "severity": "medium"},
+                ],
+                "comment_platform": {"platform": "gitlab", "project_id": "org%2Frepo", "number": 15},
+                "source_diff": "diff --git a/src/example.py b/src/example.py\n@@ -9,1 +9,2 @@\n context\n+new\n",
+                "source_diff_refs": {
+                    "base_sha": "base123",
+                    "start_sha": "start123",
+                    "head_sha": "head123",
+                },
+            },
+        )
+
+        mock_auth = subprocess.CompletedProcess(args=["glab", "auth", "status"], returncode=0)
+        with patch(
+            "overdrive.comments.writer.post_comments_batch",
+            return_value=[CommentPostResult(success=True, platform_id="discussion-1")],
+        ) as mock_batch, patch("shutil.which", return_value="/usr/bin/glab"), patch(
+            "overdrive.runtime.api.routes_tasks.subprocess.run",
+            return_value=mock_auth,
+        ):
+            resp = client.post(f"/api/tasks/{task.id}/post-review-comments")
+
+        assert resp.status_code == 200
+        call_args = mock_batch.call_args
+        assert call_args.kwargs["source_diff"] == task.metadata["source_diff"]
+        assert call_args.kwargs["gitlab_diff_refs"] == task.metadata["source_diff_refs"]
+
     def test_metadata_contains_generated_review_comments_after_executor(self, tmp_path: Path) -> None:
         """Verify generated_review_comments is not in internal metadata keys."""
         from overdrive.runtime.api.routes_tasks import _INTERNAL_TASK_METADATA_KEYS
