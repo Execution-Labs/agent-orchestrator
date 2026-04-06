@@ -525,6 +525,7 @@ def post_mr_comment(
         mr_number: Merge request IID.
         path: File path for inline comments.
         line: Line number for inline comments.
+        position: Fully resolved GitLab diff position payload for inline comments.
         body: Comment body text.
         cwd: Working directory for ``glab`` CLI context.
         in_reply_to: Platform ID of note to reply to.
@@ -657,6 +658,8 @@ def post_comments_batch(
             optionally ``in_reply_to``.
         git_dir: Local git directory for CLI context.
         commit_id: Optional commit SHA for inline comments.
+        source_diff: Unified diff text used to resolve GitLab inline positions.
+        gitlab_diff_refs: GitLab MR diff refs containing base/start/head SHAs.
 
     Returns:
         List of :class:`CommentPostResult` in the same order as *comments*.
