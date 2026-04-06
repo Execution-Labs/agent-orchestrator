@@ -28,6 +28,7 @@ _DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
 _HUNK_RE = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
 )
+_TRUNCATED_DIFF_NOTICE = "[DIFF TRUNCATED"
 
 
 def parse_source_url(url: str) -> dict[str, Any]:
@@ -218,6 +219,27 @@ def _get_gitlab_mr_diff_refs(
     }
 
 
+def _get_gitlab_mr_diff(
+    mr_number: int,
+    *,
+    cwd: Path | None = None,
+) -> str | None:
+    """Fetch the full GitLab merge request diff for inline position resolution."""
+    try:
+        result = subprocess.run(
+            ["glab", "mr", "diff", str(mr_number)],
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    diff_text = str(result.stdout or "")
+    return diff_text if diff_text.strip() else None
+
+
 def _normalize_gitlab_diff_refs(diff_refs: dict[str, Any] | None) -> dict[str, str] | None:
     """Validate and normalize GitLab diff refs required for inline comments."""
     if not isinstance(diff_refs, dict):
@@ -232,6 +254,11 @@ def _normalize_gitlab_diff_refs(diff_refs: dict[str, Any] | None) -> dict[str, s
         "start_sha": start_sha,
         "head_sha": head_sha,
     }
+
+
+def _is_truncated_diff(diff_text: str | None) -> bool:
+    """Report whether the stored diff includes the truncation sentinel."""
+    return _TRUNCATED_DIFF_NOTICE in str(diff_text or "")
 
 
 def _resolve_gitlab_diff_position(
@@ -668,6 +695,8 @@ def post_comments_batch(
     platform = str(platform_info.get("platform", ""))
     resolved_gitlab_diff_refs = _normalize_gitlab_diff_refs(gitlab_diff_refs)
     attempted_gitlab_diff_ref_lookup = False
+    resolved_source_diff = str(source_diff or "")
+    attempted_gitlab_diff_lookup = False
 
     for i, comment in enumerate(comments):
         if i > 0:
@@ -715,9 +744,27 @@ def post_comments_batch(
                 position = _resolve_gitlab_diff_position(
                     path=str(path),
                     line=line,
-                    source_diff=source_diff,
+                    source_diff=resolved_source_diff,
                     diff_refs=resolved_gitlab_diff_refs,
                 )
+                if (
+                    position is None
+                    and not attempted_gitlab_diff_lookup
+                    and (_is_truncated_diff(resolved_source_diff) or not resolved_source_diff.strip())
+                ):
+                    attempted_gitlab_diff_lookup = True
+                    live_diff = _get_gitlab_mr_diff(
+                        int(platform_info["number"]),
+                        cwd=git_dir,
+                    )
+                    if live_diff:
+                        resolved_source_diff = live_diff
+                        position = _resolve_gitlab_diff_position(
+                            path=str(path),
+                            line=line,
+                            source_diff=resolved_source_diff,
+                            diff_refs=resolved_gitlab_diff_refs,
+                        )
                 if position is None:
                     results.append(
                         CommentPostResult(

@@ -12,6 +12,7 @@ import pytest
 from overdrive.comments.writer import (
     CommentPostResult,
     _extract_id_from_response,
+    _get_gitlab_mr_diff,
     _get_gitlab_mr_diff_refs,
     _get_gitlab_mr_head_sha,
     _resolve_gitlab_diff_position,
@@ -361,6 +362,19 @@ class TestGetGitLabMrDiffRefs:
         }
 
 
+class TestGetGitLabMrDiff:
+    @patch("overdrive.comments.writer.subprocess.run")
+    def test_reads_full_diff(self, mock_run: object) -> None:
+        mock_run_fn = mock_run  # type: ignore[assignment]
+        mock_run_fn.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="diff --git a/a.py b/a.py\n",
+            stderr="",
+        )
+        assert _get_gitlab_mr_diff(5, cwd=GIT_DIR) == "diff --git a/a.py b/a.py\n"
+
+
 class TestResolveGitLabDiffPosition:
     def test_resolves_added_line(self) -> None:
         diff = (
@@ -473,6 +487,47 @@ class TestPostCommentsBatch:
         )
         assert len(results) == 1
         assert results[0].success is True
+        call_args = mock_post_fn.call_args
+        assert call_args.kwargs["position"] == {
+            "position_type": "text",
+            "base_sha": "base123",
+            "start_sha": "start123",
+            "head_sha": "head123",
+            "old_path": "src/example.py",
+            "new_path": "src/example.py",
+            "new_line": 10,
+        }
+
+    @patch("overdrive.comments.writer._get_gitlab_mr_diff")
+    @patch("overdrive.comments.writer.post_mr_comment")
+    def test_batch_gitlab_inline_comment_retries_with_live_diff_when_truncated(
+        self,
+        mock_post: object,
+        mock_get_diff: object,
+    ) -> None:
+        mock_post_fn = mock_post  # type: ignore[assignment]
+        mock_get_diff_fn = mock_get_diff  # type: ignore[assignment]
+        mock_post_fn.return_value = CommentPostResult(success=True, platform_id="2")
+        mock_get_diff_fn.return_value = (
+            "diff --git a/src/example.py b/src/example.py\n"
+            "--- a/src/example.py\n"
+            "+++ b/src/example.py\n"
+            "@@ -9,1 +9,2 @@\n"
+            " context_line\n"
+            "+new_line\n"
+        )
+        platform = {"platform": "gitlab", "project_id": "g%2Fr", "number": 5}
+        comments = [{"body": "A", "path": "src/example.py", "line": 10}]
+        results = post_comments_batch(
+            platform,
+            comments,
+            git_dir=GIT_DIR,
+            source_diff="[DIFF TRUNCATED — exceeded 100K character limit.]",
+            gitlab_diff_refs={"base_sha": "base123", "start_sha": "start123", "head_sha": "head123"},
+        )
+        assert len(results) == 1
+        assert results[0].success is True
+        mock_get_diff_fn.assert_called_once_with(5, cwd=GIT_DIR)
         call_args = mock_post_fn.call_args
         assert call_args.kwargs["position"] == {
             "position_type": "text",
