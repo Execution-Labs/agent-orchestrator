@@ -34,7 +34,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Step names handled directly by the executor (not dispatched to workers).
-_ORCHESTRATOR_COMMENT_STEPS: set[str] = {"fetch_comments", "post_comments", "post_comment_responses"}
+_ORCHESTRATOR_COMMENT_STEPS: set[str] = {
+    "fetch_comments",
+    "post_comments",
+    "post_comment_responses",
+}
+_TRUNCATED_DIFF_NOTICE = "[DIFF TRUNCATED"
 
 
 def _step_output_parse_error(step_name: str, exc: Exception, raw_output: str) -> str:
@@ -76,6 +81,87 @@ def _prepare_post_review_gate_context(task: Task) -> None:
             "addressed": parsed.get("addressed_comments", []),
             "unaddressed": parsed.get("unaddressed_comments", []),
         }
+
+
+def _extract_diff_file_paths(diff_text: str) -> set[str]:
+    """Extract changed file paths from git-style or unified diff text.
+
+    Args:
+        diff_text: Diff text captured for the review task.
+
+    Returns:
+        Set of repository-relative file paths referenced by the diff headers.
+    """
+    paths: set[str] = set()
+    current_old_path: str | None = None
+
+    for raw_line in str(diff_text or "").splitlines():
+        git_diff_match = re.match(r"^diff --git a/(.+?) b/(.+)$", raw_line)
+        if git_diff_match:
+            old_path = git_diff_match.group(1).strip()
+            new_path = git_diff_match.group(2).strip()
+            if old_path and old_path != "/dev/null":
+                paths.add(old_path)
+            if new_path and new_path != "/dev/null":
+                paths.add(new_path)
+            current_old_path = old_path or None
+            continue
+
+        if raw_line.startswith("--- "):
+            raw_old_path = raw_line[4:].strip()
+            if raw_old_path == "/dev/null":
+                current_old_path = None
+            elif raw_old_path.startswith("a/"):
+                current_old_path = raw_old_path[2:]
+                paths.add(current_old_path)
+            elif raw_old_path:
+                current_old_path = raw_old_path
+                paths.add(current_old_path)
+            continue
+
+        if raw_line.startswith("+++ "):
+            raw_new_path = raw_line[4:].strip()
+            if raw_new_path == "/dev/null":
+                continue
+            if raw_new_path.startswith("b/"):
+                paths.add(raw_new_path[2:])
+            elif raw_new_path:
+                paths.add(raw_new_path)
+            elif current_old_path:
+                paths.add(current_old_path)
+
+    return paths
+
+
+def _is_truncated_diff(diff_text: str | None) -> bool:
+    """Report whether a stored review diff includes the truncation sentinel."""
+    return _TRUNCATED_DIFF_NOTICE in str(diff_text or "")
+
+
+def _should_preserve_step_outputs(task: Task) -> bool:
+    """Report whether step outputs must survive run cleanup for this task.
+
+    Args:
+        task: Task being finalized after a run completes.
+
+    Returns:
+        ``True`` when downstream review posting still depends on persisted step
+        outputs, otherwise ``False``.
+    """
+    if not isinstance(task.metadata, dict):
+        return False
+    step_outputs = task.metadata.get("step_outputs")
+    if not isinstance(step_outputs, dict):
+        return False
+
+    preserve_keys_by_type: dict[str, tuple[str, ...]] = {
+        "pr_review_comment": ("pr_review_comment",),
+        "mr_review_comment": ("pr_review_comment",),
+        "pr_review_fix_respond": ("pr_review_fix_respond",),
+        "mr_review_fix_respond": ("pr_review_fix_respond",),
+    }
+    keys = preserve_keys_by_type.get(task.task_type, ())
+    return any(str(step_outputs.get(key) or "").strip() for key in keys)
 
 
 def _get_current_head_sha(cwd: Path | str) -> str:
@@ -172,7 +258,9 @@ class TaskExecutor:
             return False
         return result.returncode == 0
 
-    def _prepare_precommit_review_context(self, task: Task, worktree_dir: Path | None) -> tuple[bool, str]:
+    def _prepare_precommit_review_context(
+        self, task: Task, worktree_dir: Path | None
+    ) -> tuple[bool, str]:
         """Persist task-scoped changes for pre-commit human review.
 
         Returns:
@@ -186,7 +274,9 @@ class TaskExecutor:
         if not worktree_dir.exists() or not worktree_dir.is_dir():
             return False, "missing task worktree context"
 
-        has_task_changes = svc._has_uncommitted_changes(worktree_dir) or svc._has_commits_ahead(worktree_dir)
+        has_task_changes = svc._has_uncommitted_changes(worktree_dir) or svc._has_commits_ahead(
+            worktree_dir
+        )
         if not has_task_changes:
             return False, "no task-scoped changes available"
 
@@ -195,8 +285,13 @@ class TaskExecutor:
             preserve_status = "preserved" if preserve_outcome else "failed"
             preserve_reason = "legacy_bool_result"
         else:
-            preserve_status = str(getattr(preserve_outcome, "get", lambda _k, _d=None: _d)("status") or "").strip()
-            preserve_reason = str(getattr(preserve_outcome, "get", lambda _k, _d=None: _d)("reason_code") or "failed_to_preserve").strip()
+            preserve_status = str(
+                getattr(preserve_outcome, "get", lambda _k, _d=None: _d)("status") or ""
+            ).strip()
+            preserve_reason = str(
+                getattr(preserve_outcome, "get", lambda _k, _d=None: _d)("reason_code")
+                or "failed_to_preserve"
+            ).strip()
         if preserve_status != "preserved":
             reason = preserve_reason
             return False, f"failed to preserve task-scoped changes ({reason})"
@@ -207,7 +302,10 @@ class TaskExecutor:
             return False, "missing preserved branch metadata"
         if not self._branch_exists(preserved_branch):
             return False, "preserved branch is not available"
-        base_branch = str(metadata.get("preserved_base_branch") or svc._run_branch or "HEAD").strip() or "HEAD"
+        base_branch = (
+            str(metadata.get("preserved_base_branch") or svc._run_branch or "HEAD").strip()
+            or "HEAD"
+        )
         base_sha = str(metadata.get("preserved_base_sha") or "").strip()
         head_sha = str(metadata.get("preserved_head_sha") or "").strip()
         if not base_sha:
@@ -238,7 +336,11 @@ class TaskExecutor:
                     head_sha = head_result.stdout.strip()
             except Exception:
                 head_sha = ""
-        diff_range = f"{base_sha}..{head_sha}" if base_sha and head_sha else f"{base_branch}..{preserved_branch}"
+        diff_range = (
+            f"{base_sha}..{head_sha}"
+            if base_sha and head_sha
+            else f"{base_branch}..{preserved_branch}"
+        )
         try:
             diff_result = subprocess.run(
                 ["git", "diff", "--binary", "--no-color", diff_range],
@@ -252,7 +354,9 @@ class TaskExecutor:
             return False, "failed to prepare review context fingerprint"
         if diff_result.returncode != 0:
             return False, "failed to prepare review context fingerprint"
-        fingerprint = hashlib.sha256((diff_result.stdout or "").encode("utf-8", errors="replace")).hexdigest()
+        fingerprint = hashlib.sha256(
+            (diff_result.stdout or "").encode("utf-8", errors="replace")
+        ).hexdigest()
         if not isinstance(task.metadata, dict):
             task.metadata = {}
         task.metadata["review_context"] = {
@@ -351,7 +455,15 @@ class TaskExecutor:
             task.status = "blocked"
             task.error = f"Cannot resolve PR/MR source: {exc}"
             svc.container.tasks.upsert(task)
-            run.steps.append({"step": "fetch_comments", "status": "error", "ts": now_iso(), "started_at": step_started, "error": str(exc)})
+            run.steps.append(
+                {
+                    "step": "fetch_comments",
+                    "status": "error",
+                    "ts": now_iso(),
+                    "started_at": step_started,
+                    "error": str(exc),
+                }
+            )
             svc.container.runs.upsert(run)
             svc._emit_task_blocked(task)
             return "blocked"
@@ -380,7 +492,15 @@ class TaskExecutor:
             task.status = "blocked"
             task.error = f"Failed to fetch comments: {exc}"
             svc.container.tasks.upsert(task)
-            run.steps.append({"step": "fetch_comments", "status": "error", "ts": now_iso(), "started_at": step_started, "error": str(exc)})
+            run.steps.append(
+                {
+                    "step": "fetch_comments",
+                    "status": "error",
+                    "ts": now_iso(),
+                    "started_at": step_started,
+                    "error": str(exc),
+                }
+            )
             svc.container.runs.upsert(run)
             svc._emit_task_blocked(task)
             return "blocked"
@@ -392,13 +512,15 @@ class TaskExecutor:
         task.metadata["comment_platform"] = platform_info
         svc.container.tasks.upsert(task)
 
-        run.steps.append({
-            "step": "fetch_comments",
-            "status": "ok",
-            "ts": now_iso(),
-            "started_at": step_started,
-            "comment_count": len(comments),
-        })
+        run.steps.append(
+            {
+                "step": "fetch_comments",
+                "status": "ok",
+                "ts": now_iso(),
+                "started_at": step_started,
+                "comment_count": len(comments),
+            }
+        )
         svc.container.runs.upsert(run)
 
         logger.info("fetch_comments: fetched %d comments for task %s", len(comments), task.id)
@@ -439,7 +561,15 @@ class TaskExecutor:
             task.status = "blocked"
             task.error = "Missing comment_platform metadata; fetch_comments may not have run"
             svc.container.tasks.upsert(task)
-            run.steps.append({"step": "post_comments", "status": "error", "ts": now_iso(), "started_at": step_started, "error": task.error})
+            run.steps.append(
+                {
+                    "step": "post_comments",
+                    "status": "error",
+                    "ts": now_iso(),
+                    "started_at": step_started,
+                    "error": task.error,
+                }
+            )
             svc.container.runs.upsert(run)
             svc._emit_task_blocked(task)
             return "blocked"
@@ -456,29 +586,47 @@ class TaskExecutor:
 
             # Filter out comments targeting files not in the diff.
             diff_text = str(meta.get("source_diff") or "")
-            if diff_text and generated_comments:
-                import re as _re
-                diff_files = set(_re.findall(r"^diff --git a/(.+?) b/", diff_text, _re.MULTILINE))
+            if diff_text and generated_comments and not _is_truncated_diff(diff_text):
+                diff_files = _extract_diff_file_paths(diff_text)
                 before = len(generated_comments)
-                generated_comments = [c for c in generated_comments if c.get("path") in diff_files]
+                if diff_files:
+                    generated_comments = [
+                        c for c in generated_comments if c.get("path") in diff_files
+                    ]
                 dropped = before - len(generated_comments)
                 if dropped:
                     logger.warning(
                         "post_comments: dropped %d comment(s) targeting files outside the diff for task %s",
-                        dropped, task.id,
+                        dropped,
+                        task.id,
                     )
 
             # Persist generated comment details in a client-visible metadata key.
             task.metadata["generated_review_comments"] = [
-                {"path": c.get("path"), "line": c.get("line"), "body": c.get("body"), "severity": c.get("severity", "medium")}
+                {
+                    "path": c.get("path"),
+                    "line": c.get("line"),
+                    "body": c.get("body"),
+                    "severity": c.get("severity", "medium"),
+                }
                 for c in generated_comments
             ]
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            logger.warning("post_comments: failed to parse worker output for task %s: %s", task.id, exc)
+            logger.warning(
+                "post_comments: failed to parse worker output for task %s: %s", task.id, exc
+            )
             task.status = "blocked"
             task.error = _step_output_parse_error("pr_review_comment", exc, raw_output)
             svc.container.tasks.upsert(task)
-            run.steps.append({"step": "post_comments", "status": "error", "ts": now_iso(), "started_at": step_started, "error": task.error})
+            run.steps.append(
+                {
+                    "step": "post_comments",
+                    "status": "error",
+                    "ts": now_iso(),
+                    "started_at": step_started,
+                    "error": task.error,
+                }
+            )
             svc.container.runs.upsert(run)
             svc._emit_task_blocked(task)
             return "blocked"
@@ -496,7 +644,9 @@ class TaskExecutor:
                 generated_comments,
                 git_dir=git_dir,
                 source_diff=str(meta.get("source_diff") or ""),
-                gitlab_diff_refs=meta.get("source_diff_refs") if isinstance(meta.get("source_diff_refs"), dict) else None,
+                gitlab_diff_refs=meta.get("source_diff_refs")
+                if isinstance(meta.get("source_diff_refs"), dict)
+                else None,
             )
             for idx, r in enumerate(post_results):
                 status = "posted" if r.success else "failed"
@@ -516,7 +666,9 @@ class TaskExecutor:
         else:
             # Dry run (default) or no comments: record without posting.
             for comment in generated_comments:
-                result_dict = CommentPostResult(success=True, platform_id="dry_run", post_status="staged").to_dict()
+                result_dict = CommentPostResult(
+                    success=True, platform_id="dry_run", post_status="staged"
+                ).to_dict()
                 result_dict["_comment_body"] = str(comment.get("body", ""))[:200]
                 result_dict["_comment_path"] = comment.get("path", "")
                 result_dict["_comment_line"] = comment.get("line")
@@ -555,7 +707,9 @@ class TaskExecutor:
                 decision_result = dr.to_dict()
                 task.metadata["review_decision_result"] = decision_result
             except Exception as exc:
-                logger.warning("post_comments: review decision failed for task %s: %s", task.id, exc)
+                logger.warning(
+                    "post_comments: review decision failed for task %s: %s", task.id, exc
+                )
                 decision_result = CommentPostResult(success=False, error=str(exc)).to_dict()
                 task.metadata["review_decision_result"] = decision_result
 
@@ -597,13 +751,23 @@ class TaskExecutor:
 
         logger.info(
             "post_comments: task %s posted=%d staged=%d failed=%d dry_run=%s",
-            task.id, posted_count, staged_count, failed_count, dry_run,
+            task.id,
+            posted_count,
+            staged_count,
+            failed_count,
+            dry_run,
         )
         svc.bus.emit(
             channel="tasks",
             event_type="task.step_completed",
             entity_id=task.id,
-            payload={"step": "post_comments", "posted_count": posted_count, "staged_count": staged_count, "failed_count": failed_count, "comment_dry_run": dry_run},
+            payload={
+                "step": "post_comments",
+                "posted_count": posted_count,
+                "staged_count": staged_count,
+                "failed_count": failed_count,
+                "comment_dry_run": dry_run,
+            },
         )
         return "ok"
 
@@ -628,7 +792,15 @@ class TaskExecutor:
             task.status = "blocked"
             task.error = "Missing comment_platform metadata; fetch_comments may not have run"
             svc.container.tasks.upsert(task)
-            run.steps.append({"step": "post_comment_responses", "status": "error", "ts": now_iso(), "started_at": step_started, "error": task.error})
+            run.steps.append(
+                {
+                    "step": "post_comment_responses",
+                    "status": "error",
+                    "ts": now_iso(),
+                    "started_at": step_started,
+                    "error": task.error,
+                }
+            )
             svc.container.runs.upsert(run)
             svc._emit_task_blocked(task)
             return "blocked"
@@ -642,11 +814,23 @@ class TaskExecutor:
                 raise ValueError("Expected JSON object from pr_review_fix_respond output")
             addressed_comments = parsed.get("addressed_comments") or []
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            logger.warning("post_comment_responses: failed to parse worker output for task %s: %s", task.id, exc)
+            logger.warning(
+                "post_comment_responses: failed to parse worker output for task %s: %s",
+                task.id,
+                exc,
+            )
             task.status = "blocked"
             task.error = _step_output_parse_error("pr_review_fix_respond", exc, raw_output)
             svc.container.tasks.upsert(task)
-            run.steps.append({"step": "post_comment_responses", "status": "error", "ts": now_iso(), "started_at": step_started, "error": task.error})
+            run.steps.append(
+                {
+                    "step": "post_comment_responses",
+                    "status": "error",
+                    "ts": now_iso(),
+                    "started_at": step_started,
+                    "error": task.error,
+                }
+            )
             svc.container.runs.upsert(run)
             svc._emit_task_blocked(task)
             return "blocked"
@@ -688,11 +872,14 @@ class TaskExecutor:
             if not platform_id and not discussion_id:
                 logger.warning(
                     "post_comment_responses: no reply target for comment %s in task %s, posting as top-level",
-                    original_id, task.id,
+                    original_id,
+                    task.id,
                 )
 
             if dry_run:
-                result_dict = CommentPostResult(success=True, platform_id="dry_run", post_status="staged").to_dict()
+                result_dict = CommentPostResult(
+                    success=True, platform_id="dry_run", post_status="staged"
+                ).to_dict()
                 result_dict["_comment_body"] = response_body[:200]
                 result_dict["_original_comment_id"] = original_id
                 results.append(result_dict)
@@ -702,7 +889,11 @@ class TaskExecutor:
             try:
                 reply_to = int(platform_id) if platform_id else None
             except (ValueError, TypeError):
-                logger.warning("post_comment_responses: non-numeric platform_id %r for comment %s", platform_id, original_id)
+                logger.warning(
+                    "post_comment_responses: non-numeric platform_id %r for comment %s",
+                    platform_id,
+                    original_id,
+                )
                 reply_to = None
             comment_data: dict[str, Any] = {
                 "body": response_body,
@@ -715,7 +906,11 @@ class TaskExecutor:
                 [comment_data],
                 git_dir=git_dir,
             )
-            r = batch_results[0] if batch_results else CommentPostResult(success=False, error="No result")
+            r = (
+                batch_results[0]
+                if batch_results
+                else CommentPostResult(success=False, error="No result")
+            )
             status = "posted" if r.success else "failed"
             result_dict = r.to_dict()
             result_dict["post_status"] = status
@@ -768,13 +963,24 @@ class TaskExecutor:
 
         logger.info(
             "post_comment_responses: task %s posted=%d staged=%d failed=%d skipped=%d dry_run=%s",
-            task.id, posted_count, staged_count, failed_count, skipped_count, dry_run,
+            task.id,
+            posted_count,
+            staged_count,
+            failed_count,
+            skipped_count,
+            dry_run,
         )
         svc.bus.emit(
             channel="tasks",
             event_type="task.step_completed",
             entity_id=task.id,
-            payload={"step": "post_comment_responses", "posted_count": posted_count, "staged_count": staged_count, "failed_count": failed_count, "comment_dry_run": dry_run},
+            payload={
+                "step": "post_comment_responses",
+                "posted_count": posted_count,
+                "staged_count": staged_count,
+                "failed_count": failed_count,
+                "comment_dry_run": dry_run,
+            },
         )
         return "ok"
 
@@ -882,7 +1088,7 @@ class TaskExecutor:
             section_start = content.find(heading)
             if section_start != -1:
                 # Find the end of this section: next H2 heading or end of file.
-                rest = content[section_start + len(heading):]
+                rest = content[section_start + len(heading) :]
                 next_h2 = re.search(r"^## ", rest, re.MULTILINE)
                 if next_h2:
                     section_end = section_start + len(heading) + next_h2.start()
@@ -986,7 +1192,9 @@ class TaskExecutor:
             expected_on_retry = bool(task_context.get("expected_on_retry"))
             old_preserved = str(task.metadata.get("preserved_branch") or "").strip()
 
-            retained_path_raw = str(task_context.get("worktree_dir") or task.metadata.get("worktree_dir") or "").strip()
+            retained_path_raw = str(
+                task_context.get("worktree_dir") or task.metadata.get("worktree_dir") or ""
+            ).strip()
             retained_path = svc._resolve_retained_task_worktree(task, retained_path_raw)
             # Only fail closed when retry context was explicitly retained or preserved.
             # Stale worktree metadata from prior gate cleanup should not block re-runs.
@@ -1033,15 +1241,22 @@ class TaskExecutor:
                 task.wait_state = None
                 task.error = "Retained task context is missing; request changes to regenerate implementation context."
                 task.current_step = task.current_step or None
-                svc._mark_task_context_retained(task, reason="context_attach_failed", expected_on_retry=True)
+                svc._mark_task_context_retained(
+                    task, reason="context_attach_failed", expected_on_retry=True
+                )
                 svc.container.tasks.upsert(task)
                 svc._emit_task_blocked(task)
                 return
 
             if worktree_dir:
                 task.metadata["worktree_dir"] = str(worktree_dir)
-                context_branch = str(task_context.get("task_branch") or f"task-{task.id}").strip() or f"task-{task.id}"
-                svc._record_task_context(task, worktree_dir=worktree_dir, task_branch=context_branch)
+                context_branch = (
+                    str(task_context.get("task_branch") or f"task-{task.id}").strip()
+                    or f"task-{task.id}"
+                )
+                svc._record_task_context(
+                    task, worktree_dir=worktree_dir, task_branch=context_branch
+                )
                 svc._clear_task_context_retained(task)
                 svc.container.tasks.upsert(task)
 
@@ -1063,7 +1278,11 @@ class TaskExecutor:
             created_new_run = False
             if checkpoint_run_id:
                 existing_run = svc.container.runs.get(checkpoint_run_id)
-                if existing_run and existing_run.task_id == task.id and existing_run.status in {"waiting_gate", "in_progress"}:
+                if (
+                    existing_run
+                    and existing_run.task_id == task.id
+                    and existing_run.status in {"waiting_gate", "in_progress"}
+                ):
                     run = existing_run
                     run.status = "in_progress"
                     run.finished_at = None
@@ -1073,7 +1292,9 @@ class TaskExecutor:
             if run is None:
                 created_new_run = True
                 task_branch = f"task-{task.id}" if worktree_dir else svc._ensure_branch()
-                run = RunRecord(task_id=task.id, status="in_progress", started_at=now_iso(), branch=task_branch)
+                run = RunRecord(
+                    task_id=task.id, status="in_progress", started_at=now_iso(), branch=task_branch
+                )
                 run.steps = []
                 if run.id not in task.run_ids:
                     task.run_ids.append(run.id)
@@ -1177,7 +1398,10 @@ class TaskExecutor:
             # pre-implement planning steps (plan, initiative_plan, commit_review)
             # must still pause so the user can review the refreshed output.
             skip_before_implement_gate = bool(
-                is_retry_run and retry_from and retry_from not in {"plan", "initiative_plan", "commit_review", "pr_review", "mr_review"}
+                is_retry_run
+                and retry_from
+                and retry_from
+                not in {"plan", "initiative_plan", "commit_review", "pr_review", "mr_review"}
             )
 
             skip_phase1 = retry_from in ("review", "commit")
@@ -1278,7 +1502,9 @@ class TaskExecutor:
                         task.current_step = "implement_fix"
                         task.metadata["pipeline_phase"] = step
                         svc.container.tasks.upsert(task)
-                        fix_outcome = svc._run_non_review_step(task, run, "implement_fix", attempt=fix_attempt + 1)
+                        fix_outcome = svc._run_non_review_step(
+                            task, run, "implement_fix", attempt=fix_attempt + 1
+                        )
                         if fix_outcome != "ok":
                             return
                         _consume_human_guidance("implement_fix")
@@ -1287,7 +1513,9 @@ class TaskExecutor:
                         task.current_step = step
                         task.metadata["pipeline_phase"] = step
                         svc.container.tasks.upsert(task)
-                        verify_outcome = svc._run_non_review_step(task, run, step, attempt=fix_attempt + 1)
+                        verify_outcome = svc._run_non_review_step(
+                            task, run, step, attempt=fix_attempt + 1
+                        )
                         if verify_outcome == "ok":
                             _consume_human_guidance(step)
                             fixed = True
@@ -1305,10 +1533,18 @@ class TaskExecutor:
                     # All verify-fix attempts exhausted — ensure task is blocked.
                     task.status = "blocked"
                     task.wait_state = None
-                    task.error = task.error or f"Could not fix {step} after {max_verify_fix_attempts} attempts"
+                    task.error = (
+                        task.error
+                        or f"Could not fix {step} after {max_verify_fix_attempts} attempts"
+                    )
                     task.current_step = step
                     svc.container.tasks.upsert(task)
-                    svc._finalize_run(task, run, status="blocked", summary=f"Blocked: {step} failed after {max_verify_fix_attempts} fix attempts")
+                    svc._finalize_run(
+                        task,
+                        run,
+                        status="blocked",
+                        summary=f"Blocked: {step} failed after {max_verify_fix_attempts} fix attempts",
+                    )
                     svc._emit_task_blocked(task)
                     return
                 _consume_human_guidance(step)
@@ -1321,19 +1557,27 @@ class TaskExecutor:
                     found = False
                     for remaining_step in steps:
                         if remaining_step in ("review", "commit"):
-                            run.steps.append({"step": remaining_step, "status": "skipped", "ts": now_iso()})
+                            run.steps.append(
+                                {"step": remaining_step, "status": "skipped", "ts": now_iso()}
+                            )
                             continue
                         if not found:
                             if remaining_step == last_phase1_step:
                                 found = True
                             continue
-                        run.steps.append({"step": remaining_step, "status": "skipped", "ts": now_iso()})
+                        run.steps.append(
+                            {"step": remaining_step, "status": "skipped", "ts": now_iso()}
+                        )
                     svc.container.runs.upsert(run)
 
                 # HITL gate: supervised/review_only need approval before done.
                 requires_done_gate = svc._should_gate(mode, "before_done")
                 pipeline_id = svc._pipeline_id_for_task(task)
-                if requires_done_gate and pipeline_id not in svc._DECOMPOSITION_PIPELINES and not resume_from_done_gate:
+                if (
+                    requires_done_gate
+                    and pipeline_id not in svc._DECOMPOSITION_PIPELINES
+                    and not resume_from_done_gate
+                ):
                     gate_resume_step = svc._BEFORE_DONE_RESUME_STEP
                     task.current_step = last_phase1_step
                     task.metadata["pipeline_phase"] = last_phase1_step
@@ -1393,21 +1637,34 @@ class TaskExecutor:
                 # When the task branch is already merged into the base branch,
                 # _has_commits_ahead returns False (commits are reachable from
                 # base), causing a false "no changes" block on retry.
-                if not skip_phase1 and not svc._has_uncommitted_changes(impl_dir) and not svc._has_commits_ahead(impl_dir):
+                if (
+                    not skip_phase1
+                    and not svc._has_uncommitted_changes(impl_dir)
+                    and not svc._has_commits_ahead(impl_dir)
+                ):
                     task.status = "blocked"
                     task.wait_state = None
                     task.error = "No file changes detected after implementation"
                     task.current_step = last_phase1_step or "implement"
                     task.metadata["pipeline_phase"] = last_phase1_step or "implement"
                     svc.container.tasks.upsert(task)
-                    svc._finalize_run(task, run, status="blocked", summary="Blocked: no changes produced by implementation steps")
+                    svc._finalize_run(
+                        task,
+                        run,
+                        status="blocked",
+                        summary="Blocked: no changes produced by implementation steps",
+                    )
                     svc._emit_task_blocked(task)
                     return
 
             if not early_complete:
                 svc._check_cancelled(task)
             review_passed = False
-            if not early_complete and has_review and retry_from not in {"commit", svc._BEFORE_DONE_RESUME_STEP}:
+            if (
+                not early_complete
+                and has_review
+                and retry_from not in {"commit", svc._BEFORE_DONE_RESUME_STEP}
+            ):
                 post_fix_validation_step = svc._select_post_fix_validation_step(steps)
 
                 review_attempt = 0
@@ -1445,14 +1702,18 @@ class TaskExecutor:
                         "ts": now_iso(),
                         "started_at": review_started,
                     }
-                    review_last_logs = task.metadata.get("last_logs") if isinstance(task.metadata, dict) else None
+                    review_last_logs = (
+                        task.metadata.get("last_logs") if isinstance(task.metadata, dict) else None
+                    )
                     if isinstance(review_last_logs, dict):
                         for key in ("stdout_path", "stderr_path", "progress_path"):
                             if review_last_logs.get(key):
                                 review_step_log[key] = review_last_logs[key]
                     if review_result.human_blocking_issues:
                         review_step_log["status"] = "blocked"
-                        review_step_log["human_blocking_issues"] = review_result.human_blocking_issues
+                        review_step_log["human_blocking_issues"] = (
+                            review_result.human_blocking_issues
+                        )
                         run.steps.append(review_step_log)
                         svc.container.runs.upsert(run)
                         svc._block_for_human_issues(
@@ -1481,7 +1742,9 @@ class TaskExecutor:
                         task.current_step = "review"
                         task.metadata["pipeline_phase"] = "review"
                         svc.container.tasks.upsert(task)
-                        svc._finalize_run(task, run, status="blocked", summary="Blocked during review")
+                        svc._finalize_run(
+                            task, run, status="blocked", summary="Blocked during review"
+                        )
                         svc._emit_task_blocked(task)
                         return
                     open_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
@@ -1493,7 +1756,9 @@ class TaskExecutor:
                         attempt=review_attempt,
                         findings=findings,
                         open_counts=open_counts,
-                        decision="changes_requested" if svc._exceeds_quality_gate(task, findings) else "approved",
+                        decision="changes_requested"
+                        if svc._exceeds_quality_gate(task, findings)
+                        else "approved",
                     )
                     if not self._ensure_workdoc_or_block(task, run, step="review"):
                         return
@@ -1507,7 +1772,11 @@ class TaskExecutor:
                         channel="review",
                         event_type="task.reviewed",
                         entity_id=task.id,
-                        payload={"attempt": review_attempt, "decision": cycle.decision, "open_counts": open_counts},
+                        payload={
+                            "attempt": review_attempt,
+                            "decision": cycle.decision,
+                            "open_counts": open_counts,
+                        },
                     )
                     svc._clear_environment_recovery_tracking(task, step="review")
                     _consume_human_guidance("review")
@@ -1527,7 +1796,9 @@ class TaskExecutor:
                     task.current_step = "implement_fix"
                     task.metadata["pipeline_phase"] = "review"
                     svc.container.tasks.upsert(task)
-                    review_fix_outcome = svc._run_non_review_step(task, run, "implement_fix", attempt=review_attempt)
+                    review_fix_outcome = svc._run_non_review_step(
+                        task, run, "implement_fix", attempt=review_attempt
+                    )
                     if review_fix_outcome != "ok":
                         return
                     _consume_human_guidance("implement_fix")
@@ -1536,7 +1807,9 @@ class TaskExecutor:
                         task.current_step = post_fix_validation_step
                         task.metadata["pipeline_phase"] = "review"
                         svc.container.tasks.upsert(task)
-                        validation_outcome = svc._run_non_review_step(task, run, post_fix_validation_step, attempt=review_attempt)
+                        validation_outcome = svc._run_non_review_step(
+                            task, run, post_fix_validation_step, attempt=review_attempt
+                        )
                         if validation_outcome != "ok":
                             if validation_outcome == "auto_requeued":
                                 return
@@ -1563,7 +1836,9 @@ class TaskExecutor:
                                 task.current_step = "implement_fix"
                                 task.metadata["pipeline_phase"] = "review"
                                 svc.container.tasks.upsert(task)
-                                validation_fix_outcome = svc._run_non_review_step(task, run, "implement_fix", attempt=vfix + 1)
+                                validation_fix_outcome = svc._run_non_review_step(
+                                    task, run, "implement_fix", attempt=vfix + 1
+                                )
                                 if validation_fix_outcome != "ok":
                                     return
                                 _consume_human_guidance("implement_fix")
@@ -1572,7 +1847,9 @@ class TaskExecutor:
                                 task.current_step = post_fix_validation_step
                                 task.metadata["pipeline_phase"] = "review"
                                 svc.container.tasks.upsert(task)
-                                retry_validation_outcome = svc._run_non_review_step(task, run, post_fix_validation_step, attempt=vfix + 1)
+                                retry_validation_outcome = svc._run_non_review_step(
+                                    task, run, post_fix_validation_step, attempt=vfix + 1
+                                )
                                 if retry_validation_outcome == "ok":
                                     _consume_human_guidance(post_fix_validation_step)
                                     validation_fixed = True
@@ -1587,10 +1864,18 @@ class TaskExecutor:
                             if not validation_fixed:
                                 task.status = "blocked"
                                 task.wait_state = None
-                                task.error = task.error or f"Could not fix {post_fix_validation_step} after {max_verify_fix_attempts} attempts"
+                                task.error = (
+                                    task.error
+                                    or f"Could not fix {post_fix_validation_step} after {max_verify_fix_attempts} attempts"
+                                )
                                 task.current_step = post_fix_validation_step
                                 svc.container.tasks.upsert(task)
-                                svc._finalize_run(task, run, status="blocked", summary=f"Blocked: {post_fix_validation_step} failed after {max_verify_fix_attempts} fix attempts")
+                                svc._finalize_run(
+                                    task,
+                                    run,
+                                    status="blocked",
+                                    summary=f"Blocked: {post_fix_validation_step} failed after {max_verify_fix_attempts} fix attempts",
+                                )
                                 svc._emit_task_blocked(task)
                                 return
                         else:
@@ -1611,7 +1896,12 @@ class TaskExecutor:
                     task.current_step = "review"
                     task.metadata["pipeline_phase"] = "review"
                     svc.container.tasks.upsert(task)
-                    svc._finalize_run(task, run, status="blocked", summary="Blocked due to unresolved review findings")
+                    svc._finalize_run(
+                        task,
+                        run,
+                        status="blocked",
+                        summary="Blocked due to unresolved review findings",
+                    )
                     svc._emit_task_blocked(task)
                     return
 
@@ -1640,7 +1930,9 @@ class TaskExecutor:
                 precommit_review_modes = {"supervised", "review_only"}
                 requires_precommit_review = mode in precommit_review_modes
                 if requires_precommit_review and retry_from != "commit":
-                    context_ok, context_reason = self._prepare_precommit_review_context(task, worktree_dir)
+                    context_ok, context_reason = self._prepare_precommit_review_context(
+                        task, worktree_dir
+                    )
                     if not context_ok:
                         task.status = "blocked"
                         task.pending_gate = None
@@ -1655,7 +1947,12 @@ class TaskExecutor:
                         if detail:
                             task.error = f"{task.error}: {detail}"
                         svc.container.tasks.upsert(task)
-                        svc._finalize_run(task, run, status="blocked", summary="Blocked: pre-commit review context unavailable")
+                        svc._finalize_run(
+                            task,
+                            run,
+                            status="blocked",
+                            summary="Blocked: pre-commit review context unavailable",
+                        )
                         svc._emit_task_blocked(task)
                         return
 
@@ -1667,13 +1964,19 @@ class TaskExecutor:
                     svc._run_summarize_step(task, run, gate_context="pre_commit")
                     # Ensure a summary step exists so the frontend doesn't
                     # fall back to the stale plan-gate summary.
-                    if not (run.steps and isinstance(run.steps[-1], dict) and run.steps[-1].get("step") == "summary"):
-                        run.steps.append({
-                            "step": "summary",
-                            "status": "ok",
-                            "ts": now_iso(),
-                            "summary": "Implementation completed. Awaiting pre-commit approval.",
-                        })
+                    if not (
+                        run.steps
+                        and isinstance(run.steps[-1], dict)
+                        and run.steps[-1].get("step") == "summary"
+                    ):
+                        run.steps.append(
+                            {
+                                "step": "summary",
+                                "status": "ok",
+                                "ts": now_iso(),
+                                "summary": "Implementation completed. Awaiting pre-commit approval.",
+                            }
+                        )
                     task.status = "in_review"
                     task.current_step = "review"
                     task.metadata["pipeline_phase"] = "review"
@@ -1724,15 +2027,24 @@ class TaskExecutor:
                             text=True,
                             timeout=10,
                         )
-                        commit_sha = head_result.stdout.strip() if head_result.returncode == 0 else None
+                        commit_sha = (
+                            head_result.stdout.strip() if head_result.returncode == 0 else None
+                        )
                     if not commit_sha:
-                        git_present = (commit_cwd / ".git").exists() or (svc.container.project_dir / ".git").exists()
+                        git_present = (commit_cwd / ".git").exists() or (
+                            svc.container.project_dir / ".git"
+                        ).exists()
                         if git_present:
                             task.status = "blocked"
                             task.wait_state = None
                             task.error = "Commit failed (no changes to commit)"
                             svc.container.tasks.upsert(task)
-                            svc._finalize_run(task, run, status="blocked", summary="Blocked: commit produced no changes")
+                            svc._finalize_run(
+                                task,
+                                run,
+                                status="blocked",
+                                summary="Blocked: commit produced no changes",
+                            )
                             svc._emit_task_blocked(task)
                             return
                 run.steps.append(
@@ -1761,16 +2073,17 @@ class TaskExecutor:
                         # Skip when the base branch hasn't moved since the
                         # worktree was created — full verify already covered
                         # that state.
-                        base_branch_sha = (
-                            (task.metadata.get("task_context") or {}).get("base_branch_sha") or ""
-                        )
+                        base_branch_sha = (task.metadata.get("task_context") or {}).get(
+                            "base_branch_sha"
+                        ) or ""
                         run_post_merge_check = not (
                             base_branch_sha and pre_merge_base_sha == base_branch_sha
                         )
 
                         if run_post_merge_check:
                             health_result = svc._integration_health.run_check(
-                                trigger_task_id=task.id, force=True,
+                                trigger_task_id=task.id,
+                                force=True,
                             )
                             if health_result and not health_result.passed:
                                 task.metadata["integration_health_degraded"] = True
@@ -1781,13 +2094,20 @@ class TaskExecutor:
                                     "trigger": "post_merge_divergence",
                                 }
 
-                merge_failure_reason = str(task.metadata.get("merge_failure_reason_code") or "").strip()
+                merge_failure_reason = str(
+                    task.metadata.get("merge_failure_reason_code") or ""
+                ).strip()
                 if task.metadata.get("merge_conflict"):
                     task.status = "blocked"
                     task.wait_state = None
                     task.error = "Merge conflict could not be resolved automatically"
                     svc.container.tasks.upsert(task)
-                    svc._finalize_run(task, run, status="blocked", summary="Blocked due to unresolved merge conflict")
+                    svc._finalize_run(
+                        task,
+                        run,
+                        status="blocked",
+                        summary="Blocked due to unresolved merge conflict",
+                    )
                     svc._emit_task_blocked(task)
                     return
                 if merge_failure_reason in {"dirty_overlapping", "git_error"}:
@@ -1795,12 +2115,21 @@ class TaskExecutor:
                     task.wait_state = None
                     if not str(task.error or "").strip():
                         if merge_failure_reason == "dirty_overlapping":
-                            task.error = "Integration branch has local changes that overlap this merge"
+                            task.error = (
+                                "Integration branch has local changes that overlap this merge"
+                            )
                         else:
                             task.error = "Git merge failed before conflict resolution"
                     svc.container.tasks.upsert(task)
-                    svc._finalize_run(task, run, status="blocked", summary=f"Blocked due to merge failure ({merge_failure_reason})")
-                    svc._emit_task_blocked(task, payload={"error": task.error, "reason_code": merge_failure_reason})
+                    svc._finalize_run(
+                        task,
+                        run,
+                        status="blocked",
+                        summary=f"Blocked due to merge failure ({merge_failure_reason})",
+                    )
+                    svc._emit_task_blocked(
+                        task, payload={"error": task.error, "reason_code": merge_failure_reason}
+                    )
                     return
 
                 svc._run_summarize_step(task, run)
@@ -1819,7 +2148,9 @@ class TaskExecutor:
                     payload={"commit": commit_sha},
                 )
             elif not early_complete:
-                requires_done_gate = svc._should_before_done_gate(task=task, mode=mode, has_commit=has_commit)
+                requires_done_gate = svc._should_before_done_gate(
+                    task=task, mode=mode, has_commit=has_commit
+                )
                 if requires_done_gate and retry_from != svc._BEFORE_DONE_RESUME_STEP:
                     gate_resume_step = svc._BEFORE_DONE_RESUME_STEP
                     task.current_step = last_phase1_step
@@ -1858,7 +2189,8 @@ class TaskExecutor:
 
             task.error = None
             task.metadata.pop("execution_checkpoint", None)
-            task.metadata.pop("step_outputs", None)
+            if not _should_preserve_step_outputs(task):
+                task.metadata.pop("step_outputs", None)
             task.metadata.pop("worktree_dir", None)
             task.metadata.pop("task_context", None)
             task.metadata.pop("recommended_action", None)
@@ -1878,14 +2210,20 @@ class TaskExecutor:
             exception_in_flight = sys.exc_info()[1] is not None
             if worktree_dir and worktree_dir.exists():
                 keep_active_context = task.status in {"in_progress", "in_review"} or (
-                    task.status == "queued" and bool(task.metadata.get("environment_auto_requeue_pending"))
+                    task.status == "queued"
+                    and bool(task.metadata.get("environment_auto_requeue_pending"))
                 )
                 if task.status == "blocked" or exception_in_flight:
                     task.metadata["worktree_dir"] = str(worktree_dir)
-                    svc._record_task_context(task, worktree_dir=worktree_dir, task_branch=f"task-{task.id}")
+                    svc._record_task_context(
+                        task, worktree_dir=worktree_dir, task_branch=f"task-{task.id}"
+                    )
                     svc._mark_task_context_retained(
                         task,
-                        reason=str(task.error or ("unexpected_exception" if exception_in_flight else "blocked")),
+                        reason=str(
+                            task.error
+                            or ("unexpected_exception" if exception_in_flight else "blocked")
+                        ),
                         expected_on_retry=True,
                     )
                     metadata_changed = True
@@ -1894,7 +2232,9 @@ class TaskExecutor:
                     # gate waits). This avoids deleting context/branch state while
                     # the task is still expected to continue.
                     task.metadata["worktree_dir"] = str(worktree_dir)
-                    svc._record_task_context(task, worktree_dir=worktree_dir, task_branch=f"task-{task.id}")
+                    svc._record_task_context(
+                        task, worktree_dir=worktree_dir, task_branch=f"task-{task.id}"
+                    )
                     svc._clear_task_context_retained(task)
                     metadata_changed = True
                 else:
@@ -1924,7 +2264,12 @@ class TaskExecutor:
                 cancel_cleanup = svc._cleanup_cancelled_task_context(task, force=True)
                 if any(
                     bool(cancel_cleanup.get(key))
-                    for key in ("metadata_changed", "worktree_removed", "branch_deleted", "lease_released")
+                    for key in (
+                        "metadata_changed",
+                        "worktree_removed",
+                        "branch_deleted",
+                        "lease_released",
+                    )
                 ):
                     metadata_changed = True
                 worktree_removed = worktree_removed or bool(cancel_cleanup.get("worktree_removed"))
