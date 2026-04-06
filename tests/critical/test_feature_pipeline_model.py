@@ -96,6 +96,10 @@ def test_feature_supervised_plan_gate_request_changes_bounded(tmp_path, request_
             assert parked["pending_gate"] == "before_implement"
             _assert_no_missing_context_error(parked)
 
+            # Pause the scheduler *before* approve-gate so ensure_worker() does
+            # not immediately pick up the re-queued task in the background.
+            _orchestrator_from_app(app).control("pause")
+
             request_changes = client.post(
                 f"/api/tasks/{task_id}/approve-gate",
                 json={
@@ -109,9 +113,6 @@ def test_feature_supervised_plan_gate_request_changes_bounded(tmp_path, request_
             assert queued["status"] == "queued"
             _assert_no_missing_context_error(queued)
             latest = _latest_task(app, task_id)
-            # request_changes starts scheduler in background; keep this bounded
-            # state-machine test deterministic for the next explicit transition.
-            _orchestrator_from_app(app).control("pause")
             assert latest.status == "queued"
 
         final_run = client.post(f"/api/tasks/{task_id}/run")
