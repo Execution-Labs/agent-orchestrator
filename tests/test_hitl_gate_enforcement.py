@@ -509,6 +509,10 @@ def test_gate_request_changes_rerun_does_not_fail_missing_context(tmp_path: Path
     assert parked.status == "in_progress"
     assert parked.pending_gate == "before_implement"
 
+    # Pause the scheduler *before* approve-gate so ensure_worker() does not
+    # immediately pick up the re-queued task in the background.
+    service.control("pause")
+
     resp = client.post(
         f"/api/tasks/{task.id}/approve-gate",
         json={"gate": "before_implement", "action": "request_changes", "guidance": "Adjust plan scope."},
@@ -517,10 +521,6 @@ def test_gate_request_changes_rerun_does_not_fail_missing_context(tmp_path: Path
     queued = container.tasks.get(task.id)
     assert queued is not None
     assert queued.status == "queued"
-
-    # approve-gate(request_changes) starts the scheduler; pause it so this test
-    # exercises a deterministic manual rerun path.
-    service.control("pause")
     rerun = service.run_task(task.id)
     assert rerun.status == "in_progress"
     assert rerun.pending_gate == "before_implement"
