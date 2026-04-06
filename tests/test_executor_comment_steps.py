@@ -279,6 +279,31 @@ class TestExecutePostComments:
         assert task.metadata["posted_comments"][0]["post_status"] == "posted"
 
     @patch("overdrive.runtime.orchestrator.task_executor.post_comments_batch")
+    def test_gitlab_live_passes_diff_context(self, mock_batch: MagicMock) -> None:
+        mock_batch.return_value = [CommentPostResult(success=True, platform_id="2001")]
+        executor, svc = self._make_executor()
+        worker_output = json.dumps({
+            "comments": [{"body": "Fix", "path": "a.py", "line": 1}],
+            "summary": "S",
+        })
+        task = _make_task({
+            "comment_platform": {"platform": "gitlab", "project_id": "g%2Fr", "number": 5},
+            "step_outputs": {"pr_review_comment": worker_output},
+            "comment_dry_run": False,
+            "source_diff": "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-old\n+new\n",
+            "source_diff_refs": {"base_sha": "base123", "start_sha": "start123", "head_sha": "head123"},
+        })
+        run = _make_run()
+
+        result = executor._execute_post_comments(task, run)
+
+        assert result == "ok"
+        mock_batch.assert_called_once()
+        call_args = mock_batch.call_args
+        assert call_args.kwargs["source_diff"] == task.metadata["source_diff"]
+        assert call_args.kwargs["gitlab_diff_refs"] == task.metadata["source_diff_refs"]
+
+    @patch("overdrive.runtime.orchestrator.task_executor.post_comments_batch")
     def test_live_partial_failure_status(self, mock_batch: MagicMock) -> None:
         """Mixed success/failure → correct post_status values."""
         mock_batch.return_value = [

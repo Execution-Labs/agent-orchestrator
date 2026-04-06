@@ -1184,6 +1184,8 @@ def _fetch_gitlab_mr_context(
     head_ref = str(mr_meta.get("source_branch") or "").strip()
     base_ref = str(mr_meta.get("target_branch") or "").strip()
     url = str(mr_meta.get("web_url") or "").strip()
+    raw_diff_refs = mr_meta.get("diff_refs")
+    diff_refs = raw_diff_refs if isinstance(raw_diff_refs, dict) else {}
 
     # Fetch MR diff.
     try:
@@ -1216,6 +1218,7 @@ def _fetch_gitlab_mr_context(
         "url": url,
         "diff": diff_text,
         "stat": stat_text,
+        "diff_refs": diff_refs,
     }
 
     if fetch_comments:
@@ -3570,6 +3573,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
                 "source_description": ctx["body"],
                 "source_diff": ctx["diff"],
                 "source_stat": ctx["stat"],
+                "source_diff_refs": ctx.get("diff_refs") or {},
                 "source_url": ctx["url"],
                 "source_ref": ctx["head_ref"],
                 "source_base_ref": ctx["base_ref"],
@@ -3836,6 +3840,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
             "source_description": ctx["body"],
             "source_diff": ctx["diff"],
             "source_stat": ctx["stat"],
+            "source_diff_refs": ctx.get("diff_refs") or {},
             "source_url": ctx["url"],
             "source_ref": ctx["head_ref"],
             "source_base_ref": ctx["base_ref"],

@@ -248,6 +248,11 @@ class TestReviewMR:
             "description": "Implements feature Y",
             "source_branch": "feature-y",
             "target_branch": "main",
+            "diff_refs": {
+                "base_sha": "base123",
+                "start_sha": "start123",
+                "head_sha": "head123",
+            },
             "web_url": "https://gitlab.com/org/repo/-/merge_requests/15",
         })
 
@@ -282,6 +287,11 @@ class TestReviewMR:
         assert isinstance(stored.metadata, dict)
         assert stored.metadata["source_diff"] != ""
         assert stored.metadata["source_url"] == "https://gitlab.com/org/repo/-/merge_requests/15"
+        assert stored.metadata["source_diff_refs"] == {
+            "base_sha": "base123",
+            "start_sha": "start123",
+            "head_sha": "head123",
+        }
 
     def test_duplicate_mr_review_returns_409(self, tmp_path: Path):
         client, container = _client_and_container(tmp_path)

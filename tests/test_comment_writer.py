@@ -12,7 +12,9 @@ import pytest
 from overdrive.comments.writer import (
     CommentPostResult,
     _extract_id_from_response,
+    _get_gitlab_mr_diff_refs,
     _get_gitlab_mr_head_sha,
+    _resolve_gitlab_diff_position,
     _run_gh_api_post,
     _run_glab_api_post,
     parse_source_url,
@@ -224,10 +226,25 @@ class TestPostMrComment:
         from unittest.mock import MagicMock
         mock_post_fn = mock_post  # type: ignore[assignment]
         mock_post_fn.return_value = (True, '{"id": 11}')
-        result = post_mr_comment("group%2Frepo", 5, path="src/b.py", line=20, body="Issue", cwd=GIT_DIR)
+        result = post_mr_comment(
+            "group%2Frepo",
+            5,
+            body="Issue",
+            cwd=GIT_DIR,
+            position={
+                "position_type": "text",
+                "base_sha": "base123",
+                "start_sha": "start123",
+                "head_sha": "head123",
+                "old_path": "src/b.py",
+                "new_path": "src/b.py",
+                "new_line": 20,
+            },
+        )
         assert result.success is True
         call_args = mock_post_fn.call_args
         assert "/discussions" in call_args[0][0]
+        assert call_args[0][1]["position"]["head_sha"] == "head123"
 
     @patch("overdrive.comments.writer._run_glab_api_post")
     def test_thread_reply_uses_discussion_notes_endpoint(self, mock_post: object) -> None:
@@ -326,6 +343,76 @@ class TestGetGitLabMrHeadSha:
         assert _get_gitlab_mr_head_sha("group%2Frepo", 5, cwd=GIT_DIR) == "cafebabe"
 
 
+class TestGetGitLabMrDiffRefs:
+    @patch("overdrive.comments.writer.subprocess.run")
+    def test_reads_diff_refs(self, mock_run: object) -> None:
+        from unittest.mock import MagicMock
+        mock_run_fn = mock_run  # type: ignore[assignment]
+        mock_run_fn.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"diff_refs":{"base_sha":"base123","start_sha":"start123","head_sha":"head123"}}',
+            stderr="",
+        )
+        assert _get_gitlab_mr_diff_refs("group%2Frepo", 5, cwd=GIT_DIR) == {
+            "base_sha": "base123",
+            "start_sha": "start123",
+            "head_sha": "head123",
+        }
+
+
+class TestResolveGitLabDiffPosition:
+    def test_resolves_added_line(self) -> None:
+        diff = (
+            "diff --git a/src/example.py b/src/example.py\n"
+            "--- a/src/example.py\n"
+            "+++ b/src/example.py\n"
+            "@@ -9,1 +9,2 @@\n"
+            " context_line\n"
+            "+new_line\n"
+        )
+        position = _resolve_gitlab_diff_position(
+            path="src/example.py",
+            line=10,
+            source_diff=diff,
+            diff_refs={"base_sha": "base123", "start_sha": "start123", "head_sha": "head123"},
+        )
+        assert position == {
+            "position_type": "text",
+            "base_sha": "base123",
+            "start_sha": "start123",
+            "head_sha": "head123",
+            "old_path": "src/example.py",
+            "new_path": "src/example.py",
+            "new_line": 10,
+        }
+
+    def test_resolves_deleted_line(self) -> None:
+        diff = (
+            "diff --git a/src/example.py b/src/example.py\n"
+            "--- a/src/example.py\n"
+            "+++ b/src/example.py\n"
+            "@@ -10,2 +10,1 @@\n"
+            "-old_line\n"
+            " unchanged\n"
+        )
+        position = _resolve_gitlab_diff_position(
+            path="src/example.py",
+            line=10,
+            source_diff=diff,
+            diff_refs={"base_sha": "base123", "start_sha": "start123", "head_sha": "head123"},
+        )
+        assert position == {
+            "position_type": "text",
+            "base_sha": "base123",
+            "start_sha": "start123",
+            "head_sha": "head123",
+            "old_path": "src/example.py",
+            "new_path": "src/example.py",
+            "old_line": 10,
+        }
+
+
 # ---------------------------------------------------------------------------
 # post_comments_batch
 # ---------------------------------------------------------------------------
@@ -360,6 +447,50 @@ class TestPostCommentsBatch:
         results = post_comments_batch(platform, comments, git_dir=GIT_DIR)
         assert len(results) == 1
         assert results[0].success is True
+
+    @patch("overdrive.comments.writer.post_mr_comment")
+    @patch("overdrive.comments.writer.time.sleep")
+    def test_batch_gitlab_inline_comment_builds_position(self, mock_sleep: object, mock_post: object) -> None:
+        from unittest.mock import MagicMock
+        mock_post_fn = mock_post  # type: ignore[assignment]
+        mock_post_fn.return_value = CommentPostResult(success=True, platform_id="2")
+        platform = {"platform": "gitlab", "project_id": "g%2Fr", "number": 5}
+        comments = [{"body": "A", "path": "src/example.py", "line": 10}]
+        diff = (
+            "diff --git a/src/example.py b/src/example.py\n"
+            "--- a/src/example.py\n"
+            "+++ b/src/example.py\n"
+            "@@ -9,1 +9,2 @@\n"
+            " context_line\n"
+            "+new_line\n"
+        )
+        results = post_comments_batch(
+            platform,
+            comments,
+            git_dir=GIT_DIR,
+            source_diff=diff,
+            gitlab_diff_refs={"base_sha": "base123", "start_sha": "start123", "head_sha": "head123"},
+        )
+        assert len(results) == 1
+        assert results[0].success is True
+        call_args = mock_post_fn.call_args
+        assert call_args.kwargs["position"] == {
+            "position_type": "text",
+            "base_sha": "base123",
+            "start_sha": "start123",
+            "head_sha": "head123",
+            "old_path": "src/example.py",
+            "new_path": "src/example.py",
+            "new_line": 10,
+        }
+
+    def test_batch_gitlab_inline_comment_fails_without_position_context(self) -> None:
+        platform = {"platform": "gitlab", "project_id": "g%2Fr", "number": 5}
+        comments = [{"body": "A", "path": "src/example.py", "line": 10}]
+        results = post_comments_batch(platform, comments, git_dir=GIT_DIR)
+        assert len(results) == 1
+        assert results[0].success is False
+        assert "diff position" in (results[0].error or "")
 
     @patch("overdrive.comments.writer.post_mr_comment")
     def test_batch_gitlab_passes_discussion_id(self, mock_post: object) -> None:

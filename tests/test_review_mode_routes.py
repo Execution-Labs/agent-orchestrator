@@ -91,6 +91,11 @@ def _mock_subprocess_run_gitlab(cmd: list[str], **kwargs: Any) -> Any:
             "description": "Implements feature Y",
             "source_branch": "feature-y",
             "target_branch": "main",
+            "diff_refs": {
+                "base_sha": "base123",
+                "start_sha": "start123",
+                "head_sha": "head123",
+            },
             "web_url": "https://gitlab.com/org/repo/-/merge_requests/15",
         })
     elif cmd[0] == "glab" and cmd[1:3] == ["mr", "diff"]:
@@ -399,6 +404,11 @@ class TestGitLabModes:
         assert isinstance(stored.metadata, dict)
         assert "source_comments" in stored.metadata
         assert "source_comments_formatted" in stored.metadata
+        assert stored.metadata["source_diff_refs"] == {
+            "base_sha": "base123",
+            "start_sha": "start123",
+            "head_sha": "head123",
+        }
 
 
 # ---------------------------------------------------------------------------

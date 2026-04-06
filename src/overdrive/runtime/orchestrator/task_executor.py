@@ -495,6 +495,8 @@ class TaskExecutor:
                 platform_info,
                 generated_comments,
                 git_dir=git_dir,
+                source_diff=str(meta.get("source_diff") or ""),
+                gitlab_diff_refs=meta.get("source_diff_refs") if isinstance(meta.get("source_diff_refs"), dict) else None,
             )
             for idx, r in enumerate(post_results):
                 status = "posted" if r.success else "failed"
