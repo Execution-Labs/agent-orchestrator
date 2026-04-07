@@ -331,7 +331,6 @@ Behavior:
 - Validates source task exists and `glab` CLI is installed.
 - Fetches MR metadata, diff, and diff stat via `glab` / `git`.
 - Creates a new `mr_review` task pre-loaded with MR context.
-- Returns 409 if a non-failed/cancelled review already exists for the same task + MR.
 
 Response:
 - `task` — the newly created review task payload.
@@ -346,7 +345,6 @@ Behavior:
 - Validates source task exists and `gh` CLI is installed.
 - Fetches PR metadata, diff, and diff stat via `gh` / `git`.
 - Creates a new `pr_review` task pre-loaded with PR context.
-- Returns 409 if a non-failed/cancelled review already exists for the same task + PR.
 
 Response:
 - `task` — the newly created review task payload.
@@ -550,7 +548,6 @@ Response:
 
 Errors:
 - `400` if platform detection or CLI check fails
-- `409` if a review task already exists for this PR/MR number
 
 ## Git
 

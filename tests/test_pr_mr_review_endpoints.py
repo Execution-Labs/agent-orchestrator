@@ -199,11 +199,12 @@ class TestReviewPR:
         assert stored.metadata["source_stat"] != ""
         assert stored.metadata["source_url"] == "https://github.com/org/repo/pull/42"
 
-    def test_duplicate_pr_review_returns_409(self, tmp_path: Path):
+    def test_multiple_pr_reviews_allowed(self, tmp_path: Path):
+        """A second review task for the same PR number should succeed."""
         client, container = _client_and_container(tmp_path)
         task = _create_task(container, title="T", task_type="feature", status="queued")
         # Pre-create an existing pr_review task for the same PR.
-        _create_task(
+        existing = _create_task(
             container,
             title="PR Review: #42",
             task_type="pr_review",
@@ -213,9 +214,39 @@ class TestReviewPR:
                 "source_pr_number": 42,
             },
         )
-        with patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/gh"):
+
+        pr_meta = json.dumps({
+            "title": "Add feature X",
+            "body": "Implements feature X",
+            "headRefName": "feature-x",
+            "baseRefName": "main",
+            "url": "https://github.com/org/repo/pull/42",
+        })
+
+        def mock_run(cmd, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            r = Result()
+            if cmd[0] == "gh":
+                r.stdout = pr_meta
+            elif cmd[0] == "git" and "diff" in cmd:
+                r.stdout = " f.py | 1 +\n 1 file changed\n"
+            return r
+
+        with (
+            patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/gh"),
+            patch("overdrive.runtime.api.routes_tasks.subprocess.run", side_effect=mock_run),
+        ):
             resp = client.post(f"/api/tasks/{task.id}/review-pr?pr_number=42")
-        assert resp.status_code == 409
+
+        assert resp.status_code == 200
+        review = resp.json()["task"]
+        assert review["task_type"] == "pr_review"
+        assert review["metadata"]["source_pr_number"] == 42
+        # The new task must be distinct from the pre-existing one.
+        assert review["id"] != existing.id
 
 
 # ---------------------------------------------------------------------------
@@ -293,10 +324,11 @@ class TestReviewMR:
             "head_sha": "head123",
         }
 
-    def test_duplicate_mr_review_returns_409(self, tmp_path: Path):
+    def test_multiple_mr_reviews_allowed(self, tmp_path: Path):
+        """A second review task for the same MR number should succeed."""
         client, container = _client_and_container(tmp_path)
         task = _create_task(container, title="T", task_type="feature", status="queued")
-        _create_task(
+        existing = _create_task(
             container,
             title="MR Review: !15",
             task_type="mr_review",
@@ -306,6 +338,42 @@ class TestReviewMR:
                 "source_mr_number": 15,
             },
         )
-        with patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/glab"):
+
+        mr_meta = json.dumps({
+            "title": "Add feature Y",
+            "description": "Implements feature Y",
+            "source_branch": "feature-y",
+            "target_branch": "main",
+            "diff_refs": {
+                "base_sha": "base123",
+                "start_sha": "start123",
+                "head_sha": "head123",
+            },
+            "web_url": "https://gitlab.com/org/repo/-/merge_requests/15",
+        })
+
+        def mock_run(cmd, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            r = Result()
+            if cmd[0] == "glab" and cmd[1:3] == ["mr", "view"]:
+                r.stdout = mr_meta
+            elif cmd[0] == "glab" and cmd[1:3] == ["mr", "diff"]:
+                r.stdout = "diff --git a/g.py b/g.py\n+world\n"
+            elif cmd[0] == "git" and "diff" in cmd:
+                r.stdout = " g.py | 1 +\n 1 file changed\n"
+            return r
+
+        with (
+            patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.runtime.api.routes_tasks.subprocess.run", side_effect=mock_run),
+        ):
             resp = client.post(f"/api/tasks/{task.id}/review-mr?mr_number=15")
-        assert resp.status_code == 409
+
+        assert resp.status_code == 200
+        review = resp.json()["task"]
+        assert review["task_type"] == "mr_review"
+        assert review["metadata"]["source_mr_number"] == 15
+        assert review["id"] != existing.id

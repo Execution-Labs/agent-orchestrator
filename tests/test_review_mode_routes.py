@@ -417,7 +417,7 @@ class TestGitLabModes:
 
 
 class TestDuplicateCheckModeSpecific:
-    """Duplicate check now uses mode-specific task_type."""
+    """Multiple reviews for the same PR are allowed regardless of mode."""
 
     def test_different_modes_for_same_pr_allowed(self, tmp_path: Path):
         """Two different modes for the same PR number should not conflict."""
@@ -441,8 +441,9 @@ class TestDuplicateCheckModeSpecific:
         assert t1 is not None and t2 is not None
         assert t1.task_type != t2.task_type
 
-    def test_same_mode_same_pr_returns_409(self, tmp_path: Path):
-        client, _ = _client_and_container(tmp_path)
+    def test_same_mode_same_pr_allows_multiple(self, tmp_path: Path):
+        """Multiple reviews with the same mode for the same PR are now allowed."""
+        client, container = _client_and_container(tmp_path)
 
         with (
             patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/gh"),
@@ -452,7 +453,12 @@ class TestDuplicateCheckModeSpecific:
             assert resp1.status_code == 200
 
             resp2 = client.post("/api/pull-requests/42/review", json={"review_mode": "fix_only"})
-            assert resp2.status_code == 409
+            assert resp2.status_code == 200
+
+        t1 = container.tasks.get(resp1.json()["task"]["id"])
+        t2 = container.tasks.get(resp2.json()["task"]["id"])
+        assert t1 is not None and t2 is not None
+        assert t1.id != t2.id
 
 
 # ---------------------------------------------------------------------------

@@ -3467,7 +3467,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         Raises:
             HTTPException: 404 if source task missing, 400 if ``gh`` CLI
-                unavailable or PR fetch fails, 409 if duplicate review exists.
+                unavailable or PR fetch fails.
         """
         container, bus, orchestrator = deps.ctx(project_dir)
         source_task = container.tasks.get(task_id)
@@ -3476,17 +3476,6 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         if not shutil.which("gh"):
             raise HTTPException(status_code=400, detail="GitHub CLI (gh) is not installed. Install it from https://cli.github.com/")
-
-        # Idempotency: reject if a pr_review task already exists for this source + PR number.
-        for existing in container.tasks.list():
-            if (
-                existing.task_type == "pr_review"
-                and isinstance(existing.metadata, dict)
-                and existing.metadata.get("source_task_id") == task_id
-                and existing.metadata.get("source_pr_number") == pr_number
-                and existing.status not in ("failed", "cancelled")
-            ):
-                raise HTTPException(status_code=409, detail=f"A PR review task already exists: {existing.id}")
 
         git_dir = container.project_dir
         ctx = _fetch_github_pr_context(git_dir, pr_number)
@@ -3537,7 +3526,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         Raises:
             HTTPException: 404 if source task missing, 400 if ``glab`` CLI
-                unavailable or MR fetch fails, 409 if duplicate review exists.
+                unavailable or MR fetch fails.
         """
         container, bus, orchestrator = deps.ctx(project_dir)
         source_task = container.tasks.get(task_id)
@@ -3546,17 +3535,6 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         if not shutil.which("glab"):
             raise HTTPException(status_code=400, detail="GitLab CLI (glab) is not installed. Install it from https://gitlab.com/gitlab-org/cli")
-
-        # Idempotency: reject if an mr_review task already exists for this source + MR number.
-        for existing in container.tasks.list():
-            if (
-                existing.task_type == "mr_review"
-                and isinstance(existing.metadata, dict)
-                and existing.metadata.get("source_task_id") == task_id
-                and existing.metadata.get("source_mr_number") == mr_number
-                and existing.status not in ("failed", "cancelled")
-            ):
-                raise HTTPException(status_code=409, detail=f"An MR review task already exists: {existing.id}")
 
         git_dir = container.project_dir
         ctx = _fetch_gitlab_mr_context(git_dir, mr_number)
@@ -3790,8 +3768,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         Raises:
             HTTPException: 400 if platform detection, CLI check, or unsupported
-                mode for the detected platform; 409 if a review task already
-                exists for this PR/MR number and mode.
+                mode for the detected platform.
         """
         container, bus, orchestrator = deps.ctx(project_dir)
         git_dir = container.project_dir
@@ -3812,16 +3789,6 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
             task_type_key, pipeline_id = _REVIEW_MODE_TO_PIPELINE_GITHUB[body.review_mode]
 
         meta_number_key = "source_pr_number" if platform == "github" else "source_mr_number"
-
-        # Duplicate check using the mode-specific task_type.
-        for existing in container.tasks.list():
-            if (
-                existing.task_type == task_type_key
-                and isinstance(existing.metadata, dict)
-                and existing.metadata.get(meta_number_key) == number
-                and existing.status not in ("failed", "cancelled")
-            ):
-                raise HTTPException(status_code=409, detail=f"A review task already exists: {existing.id}")
 
         # Fetch context, optionally including comments.
         needs_comments = body.review_mode in _MODES_NEEDING_COMMENTS
