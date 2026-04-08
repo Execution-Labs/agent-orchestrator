@@ -365,7 +365,7 @@ class TestExecutePostComments:
 
         assert result == "ok"
         assert task.metadata["generated_review_comments"] == [
-            {"path": "src/example.py", "line": 10, "body": "Fix", "severity": "medium"},
+            {"path": "src/example.py", "line": 10, "body": "Fix", "severity": "medium", "post_status": "staged"},
         ]
         mock_batch.assert_called_once()
 
@@ -400,7 +400,7 @@ class TestExecutePostComments:
 
         assert result == "ok"
         assert task.metadata["generated_review_comments"] == [
-            {"path": "src/missing.py", "line": 10, "body": "Fix", "severity": "medium"},
+            {"path": "src/missing.py", "line": 10, "body": "Fix", "severity": "medium", "post_status": "staged"},
         ]
         mock_batch.assert_called_once()
         assert mock_batch.call_args.args[1] == [{"body": "Fix", "path": "src/missing.py", "line": 10}]

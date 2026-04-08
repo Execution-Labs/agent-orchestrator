@@ -4827,6 +4827,7 @@ export default function App() {
         const c = genComments?.[idx]
         if (!c || (c.post_status ?? 'staged') === 'posted') continue
         const editedBody = editedCommentBodies.get(idx)
+        if (editedBody !== undefined && !editedBody.trim()) continue
         comments.push(editedBody !== undefined ? { index: idx, body: editedBody } : { index: idx })
       }
       if (comments.length === 0) return
@@ -5616,17 +5617,19 @@ export default function App() {
                   ) : null}
                   <div className="generated-comments-list">
                     {genComments.map((c, i) => {
-                      const status = c.post_status ?? 'staged'
+                      const rawStatus = c.post_status ?? 'staged'
+                      const status = ['staged', 'posted', 'failed'].includes(rawStatus) ? rawStatus : 'staged'
                       const isPosted = status === 'posted'
                       const isEditing = editingCommentIndex === i
                       const displayBody = editedCommentBodies.get(i) ?? c.body ?? ''
                       const isEdited = editedCommentBodies.has(i) && editedCommentBodies.get(i) !== c.body
                       return (
-                        <div key={i} className={`generated-comment-item${isPosted ? ' comment-posted' : ''}`}>
+                        <div key={`${c.path ?? ''}:${c.line ?? ''}:${i}`} className={`generated-comment-item${isPosted ? ' comment-posted' : ''}`}>
                           <div className="generated-comment-item-row">
                             <input
                               type="checkbox"
                               className="generated-comment-checkbox"
+                              aria-label={`Select comment at ${c.path || 'general'}${c.line ? ':' + c.line : ''}`}
                               checked={selectedCommentIndices.has(i)}
                               disabled={isPosted}
                               onChange={() => {
@@ -5642,7 +5645,7 @@ export default function App() {
                               <p className="generated-comment-location">
                                 <code>{c.path || '(general)'}</code>
                                 {c.line ? <span>:{c.line}</span> : null}
-                                {c.severity ? <span className={`status-pill status-pill-inline severity-${c.severity}`}>{c.severity}</span> : null}
+                                {c.severity && ['critical', 'high', 'medium', 'low'].includes(c.severity) ? <span className={`status-pill status-pill-inline severity-${c.severity}`}>{c.severity}</span> : null}
                                 <span className={`status-pill status-pill-inline post-status-${status}`}>{status}</span>
                                 {isEdited ? <span className="generated-comment-edited-badge">(edited)</span> : null}
                               </p>

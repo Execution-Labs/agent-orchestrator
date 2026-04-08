@@ -589,10 +589,10 @@ class TaskExecutor:
             if diff_text and generated_comments and not _is_truncated_diff(diff_text):
                 diff_files = _extract_diff_file_paths(diff_text)
                 before = len(generated_comments)
-                if diff_files:
-                    generated_comments = [
-                        c for c in generated_comments if c.get("path") in diff_files
-                    ]
+                generated_comments = [
+                    c for c in generated_comments
+                    if not c.get("path") or c.get("path") in diff_files
+                ]
                 dropped = before - len(generated_comments)
                 if dropped:
                     logger.warning(
@@ -608,6 +608,7 @@ class TaskExecutor:
                     "line": c.get("line"),
                     "body": c.get("body"),
                     "severity": c.get("severity", "medium"),
+                    "post_status": "staged",
                 }
                 for c in generated_comments
             ]

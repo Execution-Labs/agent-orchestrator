@@ -147,13 +147,13 @@ def _run_glab_api_post(
         return False, f"glab api POST OS error: {exc}"
 
 
-def _get_gitlab_mr_head_sha(
+def _get_gitlab_mr_info(
     project_id: str,
     mr_number: int,
     *,
     cwd: Path | None = None,
-) -> str | None:
-    """Fetch the current HEAD SHA for a GitLab merge request."""
+) -> dict[str, Any] | None:
+    """Fetch metadata for a GitLab merge request (SHA, diff refs, etc.)."""
     endpoint = f"projects/{project_id}/merge_requests/{mr_number}"
     try:
         result = subprocess.run(
@@ -167,8 +167,20 @@ def _get_gitlab_mr_head_sha(
         data = json.loads(result.stdout or "{}")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         return None
+    if isinstance(data, dict):
+        return data
+    return None
 
-    if not isinstance(data, dict):
+
+def _get_gitlab_mr_head_sha(
+    project_id: str,
+    mr_number: int,
+    *,
+    cwd: Path | None = None,
+) -> str | None:
+    """Fetch the current HEAD SHA for a GitLab merge request."""
+    data = _get_gitlab_mr_info(project_id, mr_number, cwd=cwd)
+    if data is None:
         return None
     sha = str(data.get("sha") or "").strip()
     if sha:
@@ -188,21 +200,8 @@ def _get_gitlab_mr_diff_refs(
     cwd: Path | None = None,
 ) -> dict[str, str] | None:
     """Fetch the current diff refs for a GitLab merge request."""
-    endpoint = f"projects/{project_id}/merge_requests/{mr_number}"
-    try:
-        result = subprocess.run(
-            ["glab", "api", endpoint, "-X", "GET"],
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=60,
-        )
-        data = json.loads(result.stdout or "{}")
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-        return None
-
-    if not isinstance(data, dict):
+    data = _get_gitlab_mr_info(project_id, mr_number, cwd=cwd)
+    if data is None:
         return None
     diff_refs = data.get("diff_refs")
     if not isinstance(diff_refs, dict):
@@ -705,9 +704,17 @@ def post_comments_batch(
         body = str(comment.get("body") or "")
         path = comment.get("path")
         raw_line = comment.get("line")
-        line = int(raw_line) if raw_line is not None and int(raw_line) > 0 else None
+        try:
+            line = int(raw_line) if raw_line is not None else None
+            if line is not None and line <= 0:
+                line = None
+        except (ValueError, TypeError):
+            line = None
         raw_reply = comment.get("in_reply_to")
-        in_reply_to = int(raw_reply) if raw_reply is not None else None
+        try:
+            in_reply_to = int(raw_reply) if raw_reply is not None else None
+        except (ValueError, TypeError):
+            in_reply_to = None
         discussion_id = str(comment.get("discussion_id") or "").strip() or None
 
         # Inline comment requires a valid line; skip if path is set but line

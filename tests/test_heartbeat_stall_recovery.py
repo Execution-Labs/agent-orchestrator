@@ -8,6 +8,7 @@ import time
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -62,55 +63,51 @@ def _make_run(task_id: str = "task-hb-test") -> RunRecord:
 
 
 class TestHasLiveChildren:
-    def test_returns_true_when_children_found(self) -> None:
-        mock_result = subprocess.CompletedProcess(
-            args=["pgrep", "-P", "123"],
-            returncode=0,
-            stdout=b"456\n789\n",
-            stderr=b"",
-        )
-        with patch("overdrive.worker.subprocess.run", return_value=mock_result):
+    def _mock_pgrep(self, group_pids: str = "", children_pids: str = "",
+                    group_rc: int = 1, children_rc: int = 1) -> Any:
+        """Helper to mock pgrep calls for -g (group) and -P (children)."""
+        def side_effect(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+            if "-g" in cmd:
+                return subprocess.CompletedProcess(cmd, group_rc, group_pids.encode(), b"")
+            if "-P" in cmd:
+                return subprocess.CompletedProcess(cmd, children_rc, children_pids.encode(), b"")
+            return subprocess.CompletedProcess(cmd, 1, b"", b"")
+        return side_effect
+
+    def test_returns_true_when_group_has_children(self) -> None:
+        # Group contains leader (123) + child (456)
+        with patch("overdrive.worker.subprocess.run",
+                    side_effect=self._mock_pgrep(group_pids="123\n456\n", group_rc=0)):
             assert _has_live_children(123) is True
 
-    def test_returns_false_when_no_children(self) -> None:
-        mock_result = subprocess.CompletedProcess(
-            args=["pgrep", "-P", "123"],
-            returncode=1,
-            stdout=b"",
-            stderr=b"",
-        )
-        with patch("overdrive.worker.subprocess.run", return_value=mock_result):
+    def test_returns_false_when_group_has_only_leader(self) -> None:
+        # Group contains only the leader itself
+        with patch("overdrive.worker.subprocess.run",
+                    side_effect=self._mock_pgrep(group_pids="123\n", group_rc=0)):
             assert _has_live_children(123) is False
 
-    def test_returns_false_when_pgrep_unavailable(self) -> None:
-        with patch(
-            "overdrive.worker.subprocess.run",
-            side_effect=FileNotFoundError("pgrep not found"),
-        ):
+    def test_returns_false_when_group_empty(self) -> None:
+        with patch("overdrive.worker.subprocess.run",
+                    side_effect=self._mock_pgrep()):
+            assert _has_live_children(123) is False
+
+    def test_falls_back_to_pgrep_p_on_pgrep_g_failure(self) -> None:
+        # pgrep -g fails, but pgrep -P finds direct children
+        def side_effect(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+            if "-g" in cmd:
+                raise FileNotFoundError("pgrep not found")
+            return subprocess.CompletedProcess(cmd, 0, b"456\n", b"")
+        with patch("overdrive.worker.subprocess.run", side_effect=side_effect):
+            assert _has_live_children(123) is True
+
+    def test_returns_false_when_both_checks_fail(self) -> None:
+        with patch("overdrive.worker.subprocess.run",
+                    side_effect=FileNotFoundError("pgrep not found")):
             assert _has_live_children(123) is False
 
     def test_returns_false_on_timeout(self) -> None:
-        with patch(
-            "overdrive.worker.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="pgrep", timeout=2),
-        ):
-            assert _has_live_children(123) is False
-
-    def test_returns_false_on_os_error(self) -> None:
-        with patch(
-            "overdrive.worker.subprocess.run",
-            side_effect=OSError("something went wrong"),
-        ):
-            assert _has_live_children(123) is False
-
-    def test_returns_false_when_stdout_empty(self) -> None:
-        mock_result = subprocess.CompletedProcess(
-            args=["pgrep", "-P", "123"],
-            returncode=0,
-            stdout=b"",
-            stderr=b"",
-        )
-        with patch("overdrive.worker.subprocess.run", return_value=mock_result):
+        with patch("overdrive.worker.subprocess.run",
+                    side_effect=subprocess.TimeoutExpired(cmd="pgrep", timeout=2)):
             assert _has_live_children(123) is False
 
 
