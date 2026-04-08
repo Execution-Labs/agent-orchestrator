@@ -626,10 +626,6 @@ def post_mr_review_decision(
     Returns:
         :class:`CommentPostResult` indicating success or failure.
     """
-    command_map: dict[ReviewDecisionType, str] = {
-        "request_changes": "/submit_review requested_changes",
-        "comment": "/submit_review reviewed",
-    }
     if decision == "approve":
         payload: dict[str, Any] = {}
         sha = _get_gitlab_mr_head_sha(project_id, mr_number, cwd=cwd)
@@ -653,10 +649,14 @@ def post_mr_review_decision(
             error=note_response if not note_ok else None,
         )
 
-    command = command_map.get(decision, "/submit_review reviewed")
-    formatted_body = f"{body}\n\n{command}" if body else command
+    # Post the review body as a plain note without GitLab quick actions.
+    # Previously we appended /submit_review quick actions here, but those
+    # auto-resolve all discussion threads the posting user participated in,
+    # silently dismissing existing unresolved feedback.
+    if not body.strip():
+        return CommentPostResult(success=True)
     endpoint = f"projects/{project_id}/merge_requests/{mr_number}/notes"
-    payload = {"body": formatted_body}
+    payload = {"body": body}
 
     ok, response = _run_glab_api_post(endpoint, payload, cwd)
     platform_id = _extract_id_from_response(response) if ok else ""

@@ -310,7 +310,8 @@ class TestPostMrReviewDecision:
         result = post_mr_review_decision("group%2Frepo", 5, decision="request_changes", body="Needs work", cwd=GIT_DIR)
         assert result.success is True
         payload = mock_post_fn.call_args[0][1]
-        assert payload["body"] == "Needs work\n\n/submit_review requested_changes"
+        # Body is posted as a plain note without /submit_review quick action
+        assert payload["body"] == "Needs work"
 
     @patch("overdrive.comments.writer._run_glab_api_post")
     def test_comment_review(self, mock_post: object) -> None:
@@ -320,7 +321,22 @@ class TestPostMrReviewDecision:
         result = post_mr_review_decision("group%2Frepo", 5, decision="comment", body="Reviewed", cwd=GIT_DIR)
         assert result.success is True
         payload = mock_post_fn.call_args[0][1]
-        assert payload["body"] == "Reviewed\n\n/submit_review reviewed"
+        # Body is posted as a plain note without /submit_review quick action
+        assert payload["body"] == "Reviewed"
+
+    @patch("overdrive.comments.writer._run_glab_api_post")
+    def test_request_changes_empty_body_skips_note(self, mock_post: object) -> None:
+        mock_post_fn = mock_post  # type: ignore[assignment]
+        result = post_mr_review_decision("group%2Frepo", 5, decision="request_changes", body="", cwd=GIT_DIR)
+        assert result.success is True
+        mock_post_fn.assert_not_called()
+
+    @patch("overdrive.comments.writer._run_glab_api_post")
+    def test_comment_empty_body_skips_note(self, mock_post: object) -> None:
+        mock_post_fn = mock_post  # type: ignore[assignment]
+        result = post_mr_review_decision("group%2Frepo", 5, decision="comment", body="  ", cwd=GIT_DIR)
+        assert result.success is True
+        mock_post_fn.assert_not_called()
 
 
 class TestGetGitLabMrHeadSha:
