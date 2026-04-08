@@ -1,4 +1,4 @@
-import { CSSProperties, FormEvent, useEffect, useRef, useState } from 'react'
+import { CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { buildApiUrl, buildAuthHeaders } from './api'
 import { ImportJobPanel } from './components/AppPanels/ImportJobPanel'
 import { TerminalPanel } from './components/AppPanels/TerminalPanel'
@@ -1797,6 +1797,9 @@ export default function App() {
   const [prPlatform, setPrPlatform] = useState<string | null>(null)
   const [postCommentsError, setPostCommentsError] = useState<string | null>(null)
   const [postCommentsErrorCode, setPostCommentsErrorCode] = useState<string | null>(null)
+  const [selectedCommentIndices, setSelectedCommentIndices] = useState<Set<number>>(new Set())
+  const [editedCommentBodies, setEditedCommentBodies] = useState<Map<number, string>>(new Map())
+  const [editingCommentIndex, setEditingCommentIndex] = useState<number | null>(null)
   const [platformStatus, setPlatformStatus] = useState<{ platform: string | null; cli_installed: boolean; cli_authenticated: boolean; cli_name: string | null; setup_steps: { step: number; label: string; done: boolean }[] } | null>(null)
   const [selectedPrNumber, setSelectedPrNumber] = useState<number | null>(null)
   const [prReviewGuidance, setPrReviewGuidance] = useState('')
@@ -1895,6 +1898,43 @@ export default function App() {
     setPlanGenerateInferDeps(defaults.infer_deps)
     setPlanGenerateSaveAsDefault(false)
   }, [selectedTaskId, taskGenerationSystemDefaults])
+
+  // Reset comment selection/edit state when task changes or post_status values change
+  const commentPostStatuses = useMemo(() => {
+    const genComments = selectedTaskDetail?.metadata?.generated_review_comments as Array<{ post_status?: string }> | undefined
+    if (!genComments || genComments.length === 0) return ''
+    return genComments.map((c) => c.post_status ?? 'staged').join(',')
+  }, [selectedTaskDetail])
+  useEffect(() => {
+    setEditedCommentBodies(new Map())
+    setEditingCommentIndex(null)
+    if (!selectedTaskId) {
+      setSelectedCommentIndices(new Set())
+      return
+    }
+    const allTasks = [
+      ...(board.columns.backlog || []),
+      ...(board.columns.queued || []),
+      ...(board.columns.in_progress || []),
+      ...(board.columns.in_review || []),
+      ...(board.columns.blocked || []),
+      ...(board.columns.done || []),
+      ...(board.columns.cancelled || []),
+    ]
+    const task = (selectedTaskDetail && selectedTaskDetail.id === selectedTaskId)
+      ? selectedTaskDetail
+      : (allTasks.find((t) => t.id === selectedTaskId) || null)
+    const genComments = task?.metadata?.generated_review_comments as Array<{ post_status?: string }> | undefined
+    if (!genComments || genComments.length === 0) {
+      setSelectedCommentIndices(new Set())
+      return
+    }
+    const staged = new Set<number>()
+    genComments.forEach((c, i) => {
+      if ((c.post_status ?? 'staged') !== 'posted') staged.add(i)
+    })
+    setSelectedCommentIndices(staged)
+  }, [selectedTaskId, commentPostStatuses])
 
   // taskEditMode removed — configLocked (status-based) controls editability
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; taskId: string } | null>(null)
@@ -4780,11 +4820,32 @@ export default function App() {
     setTaskActionError('')
     setTaskActionMessage('')
     try {
+      // Build selective payload from current selection state
+      const genComments = selectedTaskDetail?.metadata?.generated_review_comments as Array<{ body?: string; post_status?: string }> | undefined
+      const comments: Array<{ index: number; body?: string }> = []
+      for (const idx of selectedCommentIndices) {
+        const c = genComments?.[idx]
+        if (!c || (c.post_status ?? 'staged') === 'posted') continue
+        const editedBody = editedCommentBodies.get(idx)
+        comments.push(editedBody !== undefined ? { index: idx, body: editedBody } : { index: idx })
+      }
+      if (comments.length === 0) return
       await requestJson<{ posted_count: number; failed_count: number }>(
         buildApiUrl(`/api/tasks/${taskId}/post-review-comments`, projectDir),
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ comments }),
+        },
       )
       await loadTaskDetail(taskId)
+      // Clear edited bodies for posted comments
+      setEditedCommentBodies((prev) => {
+        const next = new Map(prev)
+        for (const c of comments) next.delete(c.index)
+        return next
+      })
+      setEditingCommentIndex(null)
       setTaskActionMessage('Review comments posted.')
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Failed to post review comments'
@@ -5524,33 +5585,105 @@ export default function App() {
               )
             })() : null}
             {(() => {
-              const genComments = selectedTaskView.metadata?.generated_review_comments as Array<{path?: string; line?: number; severity?: string; body?: string}> | undefined
-              const postResults = selectedTaskView.metadata?.posted_comments as Array<{success?: boolean; platform_id?: string; error?: string}> | undefined
+              const genComments = selectedTaskView.metadata?.generated_review_comments as Array<{path?: string; line?: number; severity?: string; body?: string; post_status?: string}> | undefined
               if (!genComments || genComments.length === 0) return null
+              const stagedCount = genComments.filter((c) => (c.post_status ?? 'staged') !== 'posted').length
+              const selectedStagedCount = Array.from(selectedCommentIndices).filter((idx) => {
+                const c = genComments[idx]
+                return c && (c.post_status ?? 'staged') !== 'posted'
+              }).length
               return (
                 <details className="execution-details-collapse" open>
                   <summary className="execution-details-toggle">
-                    Generated comments ({genComments.length})
+                    Generated comments ({selectedStagedCount} of {genComments.length} selected)
                   </summary>
+                  {stagedCount > 0 ? (
+                    <div className="generated-comments-toolbar">
+                      <button
+                        className="link-button"
+                        onClick={() => {
+                          const allStaged = new Set<number>()
+                          genComments.forEach((c, i) => {
+                            if ((c.post_status ?? 'staged') !== 'posted') allStaged.add(i)
+                          })
+                          const allSelected = Array.from(allStaged).every((i) => selectedCommentIndices.has(i))
+                          setSelectedCommentIndices(allSelected ? new Set() : allStaged)
+                        }}
+                      >
+                        {genComments.every((c, idx) => (c.post_status ?? 'staged') === 'posted' || selectedCommentIndices.has(idx)) ? 'Deselect All' : 'Select All'}
+                      </button>
+                    </div>
+                  ) : null}
                   <div className="generated-comments-list">
                     {genComments.map((c, i) => {
-                      const result = postResults?.[i]
+                      const status = c.post_status ?? 'staged'
+                      const isPosted = status === 'posted'
+                      const isEditing = editingCommentIndex === i
+                      const displayBody = editedCommentBodies.get(i) ?? c.body ?? ''
+                      const isEdited = editedCommentBodies.has(i) && editedCommentBodies.get(i) !== c.body
                       return (
-                        <div key={i} className="generated-comment-item">
-                          <p className="generated-comment-location">
-                            <code>{c.path || '(general)'}</code>
-                            {c.line ? <span>:{c.line}</span> : null}
-                            {c.severity ? <span className={`status-pill status-pill-inline severity-${c.severity}`}>{c.severity}</span> : null}
-                            {result ? (
-                              <span className={`status-pill status-pill-inline ${result.success ? 'status-done' : 'status-failed'}`}>
-                                {result.success ? (result.platform_id === 'dry_run' ? 'dry-run' : 'posted') : 'failed'}
-                              </span>
-                            ) : null}
-                          </p>
-                          {result && !result.success && result.error ? (
-                            <p className="generated-comment-error">{result.error}</p>
-                          ) : null}
-                          <RenderedMarkdown content={c.body || ''} className="generated-comment-body" />
+                        <div key={i} className={`generated-comment-item${isPosted ? ' comment-posted' : ''}`}>
+                          <div className="generated-comment-item-row">
+                            <input
+                              type="checkbox"
+                              className="generated-comment-checkbox"
+                              checked={selectedCommentIndices.has(i)}
+                              disabled={isPosted}
+                              onChange={() => {
+                                setSelectedCommentIndices((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(i)) next.delete(i)
+                                  else next.add(i)
+                                  return next
+                                })
+                              }}
+                            />
+                            <div className="generated-comment-content">
+                              <p className="generated-comment-location">
+                                <code>{c.path || '(general)'}</code>
+                                {c.line ? <span>:{c.line}</span> : null}
+                                {c.severity ? <span className={`status-pill status-pill-inline severity-${c.severity}`}>{c.severity}</span> : null}
+                                <span className={`status-pill status-pill-inline post-status-${status}`}>{status}</span>
+                                {isEdited ? <span className="generated-comment-edited-badge">(edited)</span> : null}
+                              </p>
+                              {isEditing ? (
+                                <div>
+                                  <textarea
+                                    className="generated-comment-edit-area"
+                                    value={displayBody}
+                                    onChange={(e) => {
+                                      const val = e.target.value
+                                      setEditedCommentBodies((prev) => {
+                                        const next = new Map(prev)
+                                        next.set(i, val)
+                                        return next
+                                      })
+                                    }}
+                                  />
+                                  <div className="generated-comment-edit-actions">
+                                    <button className="link-button" onClick={() => setEditingCommentIndex(null)}>Done</button>
+                                    <button className="link-button" onClick={() => {
+                                      setEditedCommentBodies((prev) => {
+                                        const next = new Map(prev)
+                                        next.delete(i)
+                                        return next
+                                      })
+                                      setEditingCommentIndex(null)
+                                    }}>Reset</button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <>
+                                  <RenderedMarkdown content={displayBody} className="generated-comment-body" />
+                                  {!isPosted ? (
+                                    <div className="generated-comment-edit-actions">
+                                      <button className="link-button" onClick={() => setEditingCommentIndex(i)}>Edit</button>
+                                    </div>
+                                  ) : null}
+                                </>
+                              )}
+                            </div>
+                          </div>
                         </div>
                       )
                     })}
@@ -7895,19 +8028,33 @@ export default function App() {
                 {taskStatus === 'done' && selectedTaskView.execution_summary?.steps.some((s) => s.commit) ? (
                   <button className="button" onClick={() => void reviewCommit(selectedTaskView.id)} disabled={isTaskActionBusy}>{taskActionPending === 'review_commit' ? 'Creating...' : 'Review Commit'}</button>
                 ) : null}
-                {selectedTaskView.metadata?.comment_dry_run &&
-                 Array.isArray(selectedTaskView.metadata?.generated_review_comments) &&
-                 (selectedTaskView.metadata.generated_review_comments as unknown[]).length > 0 &&
-                 (taskStatus === 'done' || taskStatus === 'in_review') ? (
-                  <>
-                    <button className="button button-primary" onClick={() => { setPostCommentsError(null); setPostCommentsErrorCode(null); void postReviewComments(selectedTaskView.id) }} disabled={isTaskActionBusy}>{taskActionPending === 'post_review_comments' ? 'Posting...' : 'Post Comments'}</button>
-                    {postCommentsError && (postCommentsErrorCode === 'cli_not_installed' || postCommentsErrorCode === 'cli_not_authenticated') ? (
-                      <div className="pr-review-setup pr-review-setup-inline">
-                        {renderPlatformSetupGuidance(postCommentsErrorCode, (selectedTaskView.metadata?.comment_platform as Record<string, string> | undefined)?.platform ?? platformStatus?.platform ?? prPlatform ?? null)}
-                      </div>
-                    ) : null}
-                  </>
-                ) : null}
+                {(() => {
+                  const gc = selectedTaskView.metadata?.generated_review_comments as Array<{ post_status?: string }> | undefined
+                  const hasComments = Array.isArray(gc) && gc.length > 0
+                  const hasStagedOrFailed = hasComments && gc.some((c) => (c.post_status ?? 'staged') !== 'posted')
+                  const showPostButton = hasComments && (taskStatus === 'done' || taskStatus === 'in_review') && (selectedTaskView.metadata?.comment_dry_run || hasStagedOrFailed)
+                  if (!showPostButton) return null
+                  const postableSelectedCount = Array.from(selectedCommentIndices).filter((idx) => {
+                    const c = gc[idx]
+                    return c && (c.post_status ?? 'staged') !== 'posted'
+                  }).length
+                  return (
+                    <>
+                      <button
+                        className="button button-primary"
+                        onClick={() => { setPostCommentsError(null); setPostCommentsErrorCode(null); void postReviewComments(selectedTaskView.id) }}
+                        disabled={isTaskActionBusy || postableSelectedCount === 0}
+                      >
+                        {taskActionPending === 'post_review_comments' ? 'Posting...' : `Post Selected Comments (${postableSelectedCount})`}
+                      </button>
+                      {postCommentsError && (postCommentsErrorCode === 'cli_not_installed' || postCommentsErrorCode === 'cli_not_authenticated') ? (
+                        <div className="pr-review-setup pr-review-setup-inline">
+                          {renderPlatformSetupGuidance(postCommentsErrorCode, (selectedTaskView.metadata?.comment_platform as Record<string, string> | undefined)?.platform ?? platformStatus?.platform ?? prPlatform ?? null)}
+                        </div>
+                      ) : null}
+                    </>
+                  )
+                })()}
                 {taskSupportsPostCompletionGeneration(selectedTaskView) ? (
                   <button className="button button-primary" onClick={() => void generateFollowUpTasks(selectedTaskView.id)} disabled={isTaskActionBusy}>{taskActionPending === 'generate_follow_ups' ? 'Generating...' : 'Generate Follow-Up Tasks'}</button>
                 ) : null}
