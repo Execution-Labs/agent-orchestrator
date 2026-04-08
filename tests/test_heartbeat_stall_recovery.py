@@ -221,9 +221,9 @@ class TestPerStepHeartbeatGrace:
         _, grace = LiveWorkerAdapter._heartbeat_settings({}, step="plan")
         assert grace == _DEFAULT_HEARTBEAT_GRACE_SECONDS
 
-    def test_verify_gets_global_default(self) -> None:
+    def test_verify_gets_extended_grace(self) -> None:
         _, grace = LiveWorkerAdapter._heartbeat_settings({}, step="verify")
-        assert grace == _DEFAULT_HEARTBEAT_GRACE_SECONDS
+        assert grace == 900
 
     def test_no_step_gets_global_default(self) -> None:
         _, grace = LiveWorkerAdapter._heartbeat_settings({})
