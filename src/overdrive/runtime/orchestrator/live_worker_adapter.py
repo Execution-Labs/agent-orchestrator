@@ -69,6 +69,8 @@ _DEFAULT_HEARTBEAT_GRACE_SECONDS = 240
 _DEFAULT_HEARTBEAT_GRACE_BY_STEP: dict[str, int] = {
     "implement": 300,
     "implement_fix": 300,
+    "verify": 900,
+    "benchmark": 900,
 }
 _HEARTBEAT_STALL_RETRY_GRACE_MULTIPLIER = 1.5
 

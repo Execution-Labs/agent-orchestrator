@@ -3090,6 +3090,83 @@ textarea {
   margin: 0.15rem 0;
 }
 
+/* Comment selection toolbar */
+.generated-comments-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  font-size: 0.82rem;
+}
+
+/* Comment item with checkbox layout */
+.generated-comment-item-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.generated-comment-checkbox {
+  margin-top: 0.15rem;
+  flex-shrink: 0;
+}
+
+.generated-comment-content {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Inline edit textarea */
+.generated-comment-edit-area {
+  width: 100%;
+  min-height: 4rem;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  padding: 0.35rem;
+  border: 1px solid var(--color-border-default);
+  border-radius: 4px;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  resize: vertical;
+}
+
+/* Edit actions row */
+.generated-comment-edit-actions {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.25rem;
+  font-size: 0.78rem;
+}
+
+/* Edited indicator */
+.generated-comment-edited-badge {
+  font-size: 0.72rem;
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+/* Post status badges */
+.post-status-staged {
+  background: var(--color-bg-tertiary, rgba(0,0,0,0.04));
+  color: var(--color-text-secondary);
+}
+
+.post-status-posted {
+  background: var(--color-success-bg, #dcfce7);
+  color: var(--color-success-text, #166534);
+}
+
+.post-status-failed {
+  background: var(--color-danger-bg, #fee2e2);
+  color: var(--color-danger-text, #991b1b);
+}
+
+/* Disabled/posted comment styling */
+.generated-comment-item.comment-posted {
+  opacity: 0.65;
+}
+
 .plan-gate-banner {
   border: 1px solid color-mix(in srgb, var(--color-warning-500) 25%, var(--color-border-default));
   border-left: 3px solid var(--color-warning-500);

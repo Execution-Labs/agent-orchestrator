@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, cast
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
@@ -50,6 +50,7 @@ GenerateTasksRequest = impl.GenerateTasksRequest
 FinalizeMergeConflictRequest = impl.FinalizeMergeConflictRequest
 PipelineClassificationRequest = impl.PipelineClassificationRequest
 PipelineClassificationResponse = impl.PipelineClassificationResponse
+PostReviewCommentsRequest = impl.PostReviewCommentsRequest
 PlanRefineRequest = impl.PlanRefineRequest
 RetryTaskRequest = impl.RetryTaskRequest
 SkipToPrecommitRequest = impl.SkipToPrecommitRequest
@@ -80,13 +81,25 @@ class CreatePullRequestReviewRequest(BaseModel):
 # Review mode → pipeline mapping
 # ---------------------------------------------------------------------------
 
-_REVIEW_MODE_TO_PIPELINE: dict[str, tuple[str, str]] = {
+_REVIEW_MODE_TO_PIPELINE_GITHUB: dict[str, tuple[str, str]] = {
     # review_mode → (task_type, pipeline_id)
     "fix_only": ("pr_review_fix_only", "pr_review_fix_only"),
     "review_comment": ("pr_review_comment", "pr_review_comment"),
     "summarize": ("pr_review_summarize", "pr_review_summarize"),
     "fix_respond": ("pr_review_fix_respond", "pr_review_fix_respond"),
 }
+
+_REVIEW_MODE_TO_PIPELINE_GITLAB: dict[str, tuple[str, str]] = {
+    # review_mode → (task_type, pipeline_id)
+    "fix_only": ("mr_review", "mr_review"),
+    "review_comment": ("mr_review_comment", "mr_review_comment"),
+    "summarize": ("mr_review_summarize", "mr_review_summarize"),
+    "fix_respond": ("mr_review_fix_respond", "mr_review_fix_respond"),
+}
+
+# Backward-compatible alias retained for tests and existing imports. This maps
+# review modes to the GitHub/default task types.
+_REVIEW_MODE_TO_PIPELINE = _REVIEW_MODE_TO_PIPELINE_GITHUB
 
 _MODES_NEEDING_COMMENTS: set[str] = {"review_comment", "summarize", "fix_respond"}
 
@@ -1147,8 +1160,8 @@ def _fetch_gitlab_mr_context(
     Args:
         git_dir: Path to the git repository.
         mr_number: GitLab merge request number.
-        fetch_comments: When True, include an empty ``comments`` list (GitLab
-            comment fetching for non-fix_only modes is not yet implemented).
+        fetch_comments: When True, also fetch MR comments and include both raw
+            and formatted comment context.
 
     Returns:
         A dict with keys: title, body, head_ref, base_ref, url, diff, stat,
@@ -1172,6 +1185,8 @@ def _fetch_gitlab_mr_context(
     head_ref = str(mr_meta.get("source_branch") or "").strip()
     base_ref = str(mr_meta.get("target_branch") or "").strip()
     url = str(mr_meta.get("web_url") or "").strip()
+    raw_diff_refs = mr_meta.get("diff_refs")
+    diff_refs = raw_diff_refs if isinstance(raw_diff_refs, dict) else {}
 
     # Fetch MR diff.
     try:
@@ -1204,11 +1219,37 @@ def _fetch_gitlab_mr_context(
         "url": url,
         "diff": diff_text,
         "stat": stat_text,
+        "diff_refs": diff_refs,
     }
 
     if fetch_comments:
-        # GitLab comment fetching for non-fix_only modes is not yet implemented.
-        result["comments"] = []
+        from ...comments.formatter import format_comments_for_prompt
+        from ...comments.reader import CommentFetchError, fetch_mr_comments
+        from ...comments.writer import parse_source_url
+
+        try:
+            project_id = str(parse_source_url(url)["project_id"])
+        except (ValueError, KeyError, TypeError):
+            project_id = ""
+
+        result["project_id"] = project_id
+        if project_id:
+            try:
+                comments = fetch_mr_comments(project_id, mr_number, cwd=git_dir)
+            except CommentFetchError:
+                comments = []
+            result["comments"] = [c.to_dict() for c in comments]
+            result["comments_formatted"] = format_comments_for_prompt(comments)
+        else:
+            result["comments"] = []
+            result["comments_formatted"] = ""
+    elif url:
+        try:
+            from ...comments.writer import parse_source_url
+
+            result["project_id"] = str(parse_source_url(url)["project_id"])
+        except (ValueError, KeyError, TypeError):
+            pass
 
     return result
 
@@ -3427,7 +3468,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         Raises:
             HTTPException: 404 if source task missing, 400 if ``gh`` CLI
-                unavailable or PR fetch fails, 409 if duplicate review exists.
+                unavailable or PR fetch fails.
         """
         container, bus, orchestrator = deps.ctx(project_dir)
         source_task = container.tasks.get(task_id)
@@ -3436,17 +3477,6 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         if not shutil.which("gh"):
             raise HTTPException(status_code=400, detail="GitHub CLI (gh) is not installed. Install it from https://cli.github.com/")
-
-        # Idempotency: reject if a pr_review task already exists for this source + PR number.
-        for existing in container.tasks.list():
-            if (
-                existing.task_type == "pr_review"
-                and isinstance(existing.metadata, dict)
-                and existing.metadata.get("source_task_id") == task_id
-                and existing.metadata.get("source_pr_number") == pr_number
-                and existing.status not in ("failed", "cancelled")
-            ):
-                raise HTTPException(status_code=409, detail=f"A PR review task already exists: {existing.id}")
 
         git_dir = container.project_dir
         ctx = _fetch_github_pr_context(git_dir, pr_number)
@@ -3497,7 +3527,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         Raises:
             HTTPException: 404 if source task missing, 400 if ``glab`` CLI
-                unavailable or MR fetch fails, 409 if duplicate review exists.
+                unavailable or MR fetch fails.
         """
         container, bus, orchestrator = deps.ctx(project_dir)
         source_task = container.tasks.get(task_id)
@@ -3506,17 +3536,6 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         if not shutil.which("glab"):
             raise HTTPException(status_code=400, detail="GitLab CLI (glab) is not installed. Install it from https://gitlab.com/gitlab-org/cli")
-
-        # Idempotency: reject if an mr_review task already exists for this source + MR number.
-        for existing in container.tasks.list():
-            if (
-                existing.task_type == "mr_review"
-                and isinstance(existing.metadata, dict)
-                and existing.metadata.get("source_task_id") == task_id
-                and existing.metadata.get("source_mr_number") == mr_number
-                and existing.status not in ("failed", "cancelled")
-            ):
-                raise HTTPException(status_code=409, detail=f"An MR review task already exists: {existing.id}")
 
         git_dir = container.project_dir
         ctx = _fetch_gitlab_mr_context(git_dir, mr_number)
@@ -3533,9 +3552,11 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
                 "source_description": ctx["body"],
                 "source_diff": ctx["diff"],
                 "source_stat": ctx["stat"],
+                "source_diff_refs": ctx.get("diff_refs") or {},
                 "source_url": ctx["url"],
                 "source_ref": ctx["head_ref"],
                 "source_base_ref": ctx["base_ref"],
+                "source_project_id": ctx.get("project_id", ""),
             },
         )
         container.tasks.upsert(review_task)
@@ -3748,8 +3769,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         Raises:
             HTTPException: 400 if platform detection, CLI check, or unsupported
-                mode for the detected platform; 409 if a review task already
-                exists for this PR/MR number and mode.
+                mode for the detected platform.
         """
         container, bus, orchestrator = deps.ctx(project_dir)
         git_dir = container.project_dir
@@ -3765,27 +3785,11 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
 
         # Resolve task_type and pipeline_id from the selected review mode.
         if platform == "gitlab":
-            if body.review_mode != "fix_only":
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Review mode '{body.review_mode}' is not yet supported for GitLab merge requests. Only 'fix_only' is available.",
-                )
-            task_type_key = "mr_review"
-            pipeline_id = "mr_review"
+            task_type_key, pipeline_id = _REVIEW_MODE_TO_PIPELINE_GITLAB[body.review_mode]
         else:
-            task_type_key, pipeline_id = _REVIEW_MODE_TO_PIPELINE[body.review_mode]
+            task_type_key, pipeline_id = _REVIEW_MODE_TO_PIPELINE_GITHUB[body.review_mode]
 
         meta_number_key = "source_pr_number" if platform == "github" else "source_mr_number"
-
-        # Duplicate check using the mode-specific task_type.
-        for existing in container.tasks.list():
-            if (
-                existing.task_type == task_type_key
-                and isinstance(existing.metadata, dict)
-                and existing.metadata.get(meta_number_key) == number
-                and existing.status not in ("failed", "cancelled")
-            ):
-                raise HTTPException(status_code=409, detail=f"A review task already exists: {existing.id}")
 
         # Fetch context, optionally including comments.
         needs_comments = body.review_mode in _MODES_NEEDING_COMMENTS
@@ -3804,6 +3808,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
             "source_description": ctx["body"],
             "source_diff": ctx["diff"],
             "source_stat": ctx["stat"],
+            "source_diff_refs": ctx.get("diff_refs") or {},
             "source_url": ctx["url"],
             "source_ref": ctx["head_ref"],
             "source_base_ref": ctx["base_ref"],
@@ -3811,10 +3816,13 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
             "comment_dry_run": True,
             "final_pipeline_id": pipeline_id,
         }
+        if platform == "gitlab" and ctx.get("project_id"):
+            metadata["source_project_id"] = ctx["project_id"]
         if body.guidance:
             metadata["review_guidance"] = body.guidance
         if needs_comments and ctx.get("comments") is not None:
             metadata["source_comments"] = ctx["comments"]
+            metadata["source_comments_formatted"] = str(ctx.get("comments_formatted") or "")
 
         if platform == "github":
             title = f"PR Review: #{number} — {ctx['title']}" if ctx["title"] else f"PR Review: #{number}"
@@ -3837,19 +3845,28 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
         return {"task": _task_payload(review_task, orchestrator=orchestrator)}
 
     @router.post("/tasks/{task_id}/post-review-comments", response_model=None)
-    async def post_review_comments(task_id: str, project_dir: Optional[str] = Query(None)) -> dict[str, Any] | JSONResponse:
+    async def post_review_comments(
+        task_id: str,
+        body: Optional[PostReviewCommentsRequest] = Body(None),
+        project_dir: Optional[str] = Query(None),
+    ) -> dict[str, Any] | JSONResponse:
         """Publish review comments that were previously generated in dry-run mode.
+
+        Supports selective posting via an optional request body with index-based
+        comment selection and per-comment body overrides.  When no body is sent
+        (or ``comments`` is empty), all staged comments are posted.
 
         Args:
             task_id: ID of the task whose dry-run comments should be posted.
+            body: Optional selection of comments to post with body overrides.
             project_dir: Optional project directory used to resolve runtime state.
 
         Returns:
-            Summary of posted/failed counts and per-comment results.
+            Summary of posted/failed/skipped counts and per-comment results.
 
         Raises:
             HTTPException: 404 if task not found, 409 if not a dry-run task or
-                no generated comments exist.
+                no generated comments exist, 422 if an index is out of range.
         """
         from ...comments.models import CommentPostResult
         from ...comments.writer import (
@@ -3871,9 +3888,65 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
         if not isinstance(generated_comments, list) or len(generated_comments) == 0:
             raise HTTPException(status_code=409, detail="No generated review comments to post")
 
+        # Lazily initialize post_status on comments created before this feature.
+        for comment in generated_comments:
+            if "post_status" not in comment:
+                comment["post_status"] = "staged"
+
         platform_info = meta.get("comment_platform")
         if not isinstance(platform_info, dict) or not platform_info.get("platform"):
             raise HTTPException(status_code=409, detail="Missing comment platform info")
+
+        # Determine which comments to post based on the request body.
+        selections = body.comments if body and body.comments else []
+
+        if selections:
+            # Validate indices.
+            for sel in selections:
+                if sel.index < 0 or sel.index >= len(generated_comments):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Comment index {sel.index} out of range (0..{len(generated_comments) - 1})",
+                    )
+
+            # Deduplicate indices, preserving order of first occurrence.
+            seen: set[int] = set()
+            unique_selections: list[tuple[int, Optional[str]]] = []
+            for sel in selections:
+                if sel.index not in seen:
+                    seen.add(sel.index)
+                    unique_selections.append((sel.index, sel.body))
+
+            source_indices: list[int] = []
+            comments_to_post: list[dict[str, Any]] = []
+            skipped_results: list[dict[str, Any]] = []
+
+            for idx, body_override in unique_selections:
+                c = generated_comments[idx]
+                if c.get("post_status") == "posted":
+                    skipped_results.append({
+                        "index": idx,
+                        "skipped": True,
+                        "post_status": "posted",
+                    })
+                    continue
+                post_copy = dict(c)
+                if body_override is not None:
+                    post_copy["body"] = body_override
+                source_indices.append(idx)
+                comments_to_post.append(post_copy)
+        else:
+            # Default: post all staged comments.
+            source_indices = []
+            comments_to_post = []
+            skipped_results = []
+            for idx, c in enumerate(generated_comments):
+                if c.get("post_status") == "staged":
+                    source_indices.append(idx)
+                    comments_to_post.append(dict(c))
+
+        if not comments_to_post and not skipped_results:
+            raise HTTPException(status_code=409, detail="No staged comments to post")
 
         git_dir = Path(orchestrator.step_project_dir(task))
 
@@ -3909,59 +3982,82 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
             except Exception:
                 pass  # If auth check itself fails, proceed and let post_comments_batch report errors.
 
-        post_results = await asyncio.to_thread(
-            post_comments_batch,
-            platform_info,
-            generated_comments,
-            git_dir=git_dir,
-        )
-
-        results: list[dict[str, Any]] = []
+        # Post only the selected/staged subset.
+        results: list[dict[str, Any]] = list(skipped_results)
         posted_count = 0
         failed_count = 0
-        for r in post_results:
-            results.append(r.to_dict())
-            if r.success:
-                posted_count += 1
-            else:
-                failed_count += 1
+        skipped_count = len(skipped_results)
 
-        task.metadata["posted_comments"] = results
-        task.metadata["comment_dry_run"] = False
+        if comments_to_post:
+            post_results = await asyncio.to_thread(
+                post_comments_batch,
+                platform_info,
+                comments_to_post,
+                git_dir=git_dir,
+                source_diff=str(meta.get("source_diff") or ""),
+                gitlab_diff_refs=meta.get("source_diff_refs") if isinstance(meta.get("source_diff_refs"), dict) else None,
+            )
 
-        # Post review decision if present and not yet posted.
-        review_decision_raw = meta.get("review_decision")
-        if isinstance(review_decision_raw, dict):
-            decision_type = str(review_decision_raw.get("decision") or "comment")
-            decision_body = str(review_decision_raw.get("body") or "")
-            platform = str(platform_info.get("platform", ""))
-            try:
-                if platform == "github":
-                    dr = await asyncio.to_thread(
-                        post_pr_review_decision,
-                        str(platform_info["owner"]),
-                        str(platform_info["repo"]),
-                        int(platform_info["number"]),
-                        decision=decision_type,  # type: ignore[arg-type]
-                        body=decision_body,
-                        git_dir=git_dir,
-                    )
-                elif platform == "gitlab":
-                    dr = await asyncio.to_thread(
-                        post_mr_review_decision,
-                        str(platform_info["project_id"]),
-                        int(platform_info["number"]),
-                        decision=decision_type,  # type: ignore[arg-type]
-                        body=decision_body,
-                        cwd=git_dir,
-                    )
+            for src_idx, r in zip(source_indices, post_results):
+                entry = r.to_dict()
+                entry["index"] = src_idx
+                entry["skipped"] = False
+                results.append(entry)
+                if r.success:
+                    generated_comments[src_idx]["post_status"] = "posted"
+                    posted_count += 1
                 else:
-                    dr = CommentPostResult(success=False, error=f"Unsupported platform: {platform}")
-                task.metadata["review_decision_result"] = dr.to_dict()
-            except Exception as exc:
-                task.metadata["review_decision_result"] = CommentPostResult(
-                    success=False, error=str(exc),
-                ).to_dict()
+                    generated_comments[src_idx]["post_status"] = "failed"
+                    failed_count += 1
+
+        # Persist updated post_status back into task metadata.
+        task.metadata["generated_review_comments"] = generated_comments
+
+        # Accumulate posted_comments across batches rather than overwriting.
+        existing_posted: list[dict[str, Any]] = meta.get("posted_comments", [])
+        if not isinstance(existing_posted, list):
+            existing_posted = []
+        new_posted = [r for r in results if not r.get("skipped")]
+        task.metadata["posted_comments"] = existing_posted + new_posted
+
+        # comment_dry_run flips to False only when all comments are posted.
+        all_posted = all(c.get("post_status") == "posted" for c in generated_comments)
+        task.metadata["comment_dry_run"] = not all_posted
+
+        # Post review decision only when all comments are posted.
+        if all_posted:
+            review_decision_raw = meta.get("review_decision")
+            if isinstance(review_decision_raw, dict):
+                decision_type = str(review_decision_raw.get("decision") or "comment")
+                decision_body = str(review_decision_raw.get("body") or "")
+                platform = str(platform_info.get("platform", ""))
+                try:
+                    if platform == "github":
+                        dr = await asyncio.to_thread(
+                            post_pr_review_decision,
+                            str(platform_info["owner"]),
+                            str(platform_info["repo"]),
+                            int(platform_info["number"]),
+                            decision=decision_type,  # type: ignore[arg-type]
+                            body=decision_body,
+                            git_dir=git_dir,
+                        )
+                    elif platform == "gitlab":
+                        dr = await asyncio.to_thread(
+                            post_mr_review_decision,
+                            str(platform_info["project_id"]),
+                            int(platform_info["number"]),
+                            decision=decision_type,  # type: ignore[arg-type]
+                            body=decision_body,
+                            cwd=git_dir,
+                        )
+                    else:
+                        dr = CommentPostResult(success=False, error=f"Unsupported platform: {platform}")
+                    task.metadata["review_decision_result"] = dr.to_dict()
+                except Exception as exc:
+                    task.metadata["review_decision_result"] = CommentPostResult(
+                        success=False, error=str(exc),
+                    ).to_dict()
 
         container.tasks.upsert(task)
         bus.emit(
@@ -3974,6 +4070,7 @@ def register_task_routes(router: APIRouter, deps: RouteDeps) -> None:
         return {
             "posted_count": posted_count,
             "failed_count": failed_count,
+            "skipped_count": skipped_count,
             "results": results,
             "task": _task_payload(task, container, orchestrator),
         }

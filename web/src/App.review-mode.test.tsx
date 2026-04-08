@@ -29,7 +29,7 @@ class MockWebSocket {
   }
 }
 
-function installFetchMock() {
+function installFetchMock(options?: { platform?: 'github' | 'gitlab'; prList?: Array<Record<string, unknown>> }) {
   const jsonResponse = (payload: unknown) =>
     Promise.resolve({
       ok: true,
@@ -38,7 +38,8 @@ function installFetchMock() {
       json: async () => payload,
     })
 
-  const prList = [
+  const platform = options?.platform ?? 'github'
+  const prList = options?.prList ?? [
     { number: 42, title: 'Add login page', author: 'alice', head_ref: 'feat/login', base_ref: 'main', url: 'https://github.com/org/repo/pull/42', has_review_task: false, review_task_id: null },
     { number: 43, title: 'Fix footer', author: 'bob', head_ref: 'fix/footer', base_ref: 'main', url: 'https://github.com/org/repo/pull/43', has_review_task: false, review_task_id: null },
   ]
@@ -47,7 +48,7 @@ function installFetchMock() {
     const u = String(url)
     if (u === '/' || u.startsWith('/?')) return jsonResponse({ project_id: 'repo-alpha' })
     if (u.includes('/api/collaboration/modes')) return jsonResponse({ modes: [] })
-    if (u.includes('/api/pull-requests') && !u.includes('/review')) return jsonResponse({ items: prList, platform: 'github' })
+    if (u.includes('/api/pull-requests') && !u.includes('/review')) return jsonResponse({ items: prList, platform })
     if (u.includes('/api/pull-requests') && u.includes('/review')) return jsonResponse({ task_id: 'task-review-1' })
     if (u.includes('/api/tasks/board')) return jsonResponse({ columns: { backlog: [], queued: [], in_progress: [], in_review: [], blocked: [], done: [] } })
     if (u.includes('/api/tasks/execution-order')) return jsonResponse({ batches: [], completed: [] })
@@ -68,6 +69,18 @@ function installFetchMock() {
       workers: { default: 'codex', default_model: '', routing: {}, providers: {} },
       project: { commands: {}, prompt_overrides: {}, prompt_injections: {}, prompt_defaults: {} },
     })
+    if (u.includes('/api/git-platform-status')) return jsonResponse({
+      platform,
+      remote_url: platform === 'gitlab' ? 'https://gitlab.com/org/repo.git' : 'https://github.com/org/repo.git',
+      cli_installed: true,
+      cli_authenticated: true,
+      cli_name: platform === 'gitlab' ? 'glab' : 'gh',
+      setup_steps: [
+        { step: 1, label: 'Configure git remote', done: true },
+        { step: 2, label: `Install ${platform === 'gitlab' ? 'glab' : 'gh'}`, done: true },
+        { step: 3, label: `Authenticate ${platform === 'gitlab' ? 'glab' : 'gh'}`, done: true },
+      ],
+    })
     if (u.includes('/api/workers/health')) return jsonResponse({ providers: [] })
     if (u.includes('/api/workers/routing')) return jsonResponse({ default: 'codex', rows: [] })
     if (u.includes('/api/terminal/session')) return jsonResponse({ session: null })
@@ -78,7 +91,10 @@ function installFetchMock() {
   return mockedFetch
 }
 
-async function openReviewTab() {
+async function openReviewTab(options?: Parameters<typeof installFetchMock>[0]) {
+  if (options) {
+    installFetchMock(options)
+  }
   render(<App />)
   await waitFor(() => expect(screen.getAllByRole('button', { name: /^Create Work$/i }).length).toBeGreaterThan(0))
   fireEvent.click(screen.getAllByRole('button', { name: /^Create Work$/i })[0])
@@ -164,5 +180,20 @@ describe('Review mode selector (simplified creation form)', () => {
       expect(body.review_decision).toBeUndefined()
       expect(body.post_comments).toBeUndefined()
     })
+  })
+
+  it('renders GitLab-specific review copy and MR selection state', async () => {
+    await openReviewTab({
+      platform: 'gitlab',
+      prList: [
+        { number: 15, title: 'Harden auth flow', author: 'carol', head_ref: 'mr/auth-hardening', base_ref: 'main', url: 'https://gitlab.com/org/repo/-/merge_requests/15', has_review_task: true, review_task_id: 'task-mr-15' },
+        { number: 16, title: 'Improve retries', author: 'dave', head_ref: 'mr/retries', base_ref: 'main', url: 'https://gitlab.com/org/repo/-/merge_requests/16', has_review_task: false, review_task_id: null },
+      ],
+    })
+
+    await waitFor(() => expect(screen.getByRole('radiogroup', { name: 'Open merge requests' })).toBeInTheDocument())
+    expect(screen.getByText('!15')).toBeInTheDocument()
+    expect(screen.getByText('!16')).toBeInTheDocument()
+    expect(screen.getByText('MR review exists')).toBeInTheDocument()
   })
 })

@@ -201,6 +201,21 @@ class ApproveGateRequest(BaseModel):
     post_comments: Optional[bool] = None
 
 
+class CommentSelection(BaseModel):
+    """Select a generated comment by index, with an optional body override."""
+    index: int
+    body: Optional[str] = None
+
+
+class PostReviewCommentsRequest(BaseModel):
+    """Optional request body for selective comment posting.
+
+    When ``comments`` is empty or the body is omitted entirely, all
+    staged comments are posted (backward-compatible default).
+    """
+    comments: list[CommentSelection] = Field(default_factory=list)
+
+
 class OrchestratorControlRequest(BaseModel):
     """Request body for runtime control actions such as pause/resume/stop."""
     action: Literal["pause", "resume", "drain", "stop", "reset", "reconcile"]

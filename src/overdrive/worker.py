@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -52,11 +54,34 @@ def _latest_mtime(paths: list[Path]) -> Optional[datetime]:
 
 
 def _has_live_children(pid: int) -> bool:
-    """Check if process has active child processes (macOS + Linux).
+    """Check if the worker's process group has any members besides the leader.
 
-    Uses ``pgrep -P`` which works on both macOS and Linux.  Falls back to
-    ``False`` when ``pgrep`` is unavailable (e.g. Windows) or times out.
+    The worker is spawned with ``start_new_session=True`` so its PID becomes
+    the process group ID.  We list all PIDs in that group via ``pgrep -g`` and
+    check if any PID other than the leader exists — this catches grandchild
+    processes even after intermediate shells have exited and the grandchild
+    has been reparented to init.
+
+    Falls back to ``pgrep -P`` (direct children only) on platforms where
+    ``pgrep -g`` is unavailable.
     """
+    try:
+        # pgrep -g <pgid>: list all processes in the process group.
+        result = subprocess.run(
+            ["pgrep", "-g", str(pid)],
+            capture_output=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            group_pids = {
+                int(p) for p in result.stdout.decode().split() if p.strip().isdigit()
+            }
+            # Exclude the group leader (the worker itself).
+            return bool(group_pids - {pid})
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Fallback: direct-child check via pgrep -P.
     try:
         result = subprocess.run(
             ["pgrep", "-P", str(pid)],
@@ -68,6 +93,34 @@ def _has_live_children(pid: int) -> bool:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
     return False
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    """Terminate the worker and all processes in its group."""
+    pgid = None
+    if hasattr(os, "killpg"):
+        try:
+            pgid = os.getpgid(process.pid)
+        except OSError:
+            pgid = None
+
+    if pgid is not None and pgid == process.pid:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+    else:
+        process.terminate()
+
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if pgid is not None and pgid == process.pid:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+        process.kill()
 
 
 class WorkerCancelledError(Exception):
@@ -128,6 +181,7 @@ def _run_codex_worker(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
 
     if on_spawn:
@@ -165,11 +219,7 @@ def _run_codex_worker(
         elapsed = time.monotonic() - start_time
         if timeout_seconds > 0 and elapsed > timeout_seconds:
             timed_out = True
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            _terminate_process_group(process)
             break
 
         heartbeat = _heartbeat_from_progress(progress_path, expected_run_id)
@@ -192,26 +242,18 @@ def _run_codex_worker(
             if _has_live_children(process.pid):
                 logger.warning(
                     "Heartbeat grace exceeded (%.0fs) but worker PID %d has "
-                    "active child processes — extending grace period.",
+                    "active descendant processes — extending grace period.",
                     age,
                     process.pid,
                 )
                 last_activity = now
                 continue
             no_heartbeat = True
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            _terminate_process_group(process)
             break
 
         if is_cancelled and is_cancelled():
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            _terminate_process_group(process)
             stdout_thread.join(timeout=5)
             stderr_thread.join(timeout=5)
             raise WorkerCancelledError("Task cancelled by user")

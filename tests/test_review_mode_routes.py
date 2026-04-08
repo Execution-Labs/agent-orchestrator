@@ -91,10 +91,27 @@ def _mock_subprocess_run_gitlab(cmd: list[str], **kwargs: Any) -> Any:
             "description": "Implements feature Y",
             "source_branch": "feature-y",
             "target_branch": "main",
+            "diff_refs": {
+                "base_sha": "base123",
+                "start_sha": "start123",
+                "head_sha": "head123",
+            },
             "web_url": "https://gitlab.com/org/repo/-/merge_requests/15",
         })
     elif cmd[0] == "glab" and cmd[1:3] == ["mr", "diff"]:
         r.stdout = "diff --git a/g.py b/g.py\n+world\n"
+    elif cmd[0] == "glab" and cmd[1] == "api":
+        r.stdout = json.dumps([
+            {
+                "id": 101,
+                "body": "Please add coverage",
+                "author": {"username": "reviewer1"},
+                "created_at": "2026-01-03T00:00:00Z",
+                "system": False,
+                "resolved": False,
+                "position": None,
+            },
+        ])
     elif cmd[0] == "git" and "diff" in cmd:
         r.stdout = " g.py | 1 +\n 1 file changed\n"
     return r
@@ -339,32 +356,59 @@ class TestCommentFetching:
 # ---------------------------------------------------------------------------
 
 
-class TestGitLabModeRestriction:
-    """GitLab only supports fix_only mode."""
+class TestGitLabModes:
+    """GitLab supports the same review modes through MR-specific task types."""
 
-    def test_gitlab_fix_only_succeeds(self, tmp_path: Path):
+    @pytest.mark.parametrize("mode,expected_task_type,expected_pipeline_id", [
+        ("fix_only", "mr_review", "mr_review"),
+        ("review_comment", "mr_review_comment", "mr_review_comment"),
+        ("summarize", "mr_review_summarize", "mr_review_summarize"),
+        ("fix_respond", "mr_review_fix_respond", "mr_review_fix_respond"),
+    ])
+    def test_gitlab_mode_creates_correct_task_type_and_pipeline(
+        self, tmp_path: Path, mode: str, expected_task_type: str, expected_pipeline_id: str,
+    ):
+        client, container = _client_and_container(tmp_path)
+        registry = PipelineRegistry()
+        expected_steps = registry.get(expected_pipeline_id).step_names()
+        with (
+            patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.runtime.api.routes_tasks.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
+            patch("overdrive.comments.reader.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.comments.reader.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
+        ):
+            resp = client.post("/api/pull-requests/15/review", json={"review_mode": mode})
+
+        assert resp.status_code == 200
+        task_data = resp.json()["task"]
+        assert task_data["task_type"] == expected_task_type
+
+        stored = container.tasks.get(task_data["id"])
+        assert stored is not None
+        assert stored.pipeline_template == expected_steps
+
+    @pytest.mark.parametrize("mode", sorted(_MODES_NEEDING_COMMENTS))
+    def test_gitlab_comment_modes_store_source_comments(self, tmp_path: Path, mode: str):
         client, container = _client_and_container(tmp_path)
         with (
             patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/glab"),
             patch("overdrive.runtime.api.routes_tasks.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
-        ):
-            resp = client.post("/api/pull-requests/15/review", json={"review_mode": "fix_only"})
-
-        assert resp.status_code == 200
-        task_data = resp.json()["task"]
-        assert task_data["task_type"] == "mr_review"
-
-    @pytest.mark.parametrize("mode", ["review_comment", "summarize", "fix_respond"])
-    def test_gitlab_non_fix_only_returns_400(self, tmp_path: Path, mode: str):
-        client, _ = _client_and_container(tmp_path)
-        with (
-            patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/glab"),
-            patch("overdrive.runtime.api.routes_tasks.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
+            patch("overdrive.comments.reader.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.comments.reader.subprocess.run", side_effect=_mock_subprocess_run_gitlab),
         ):
             resp = client.post("/api/pull-requests/15/review", json={"review_mode": mode})
 
-        assert resp.status_code == 400
-        assert "not yet supported" in resp.json()["detail"]
+        assert resp.status_code == 200
+        stored = container.tasks.get(resp.json()["task"]["id"])
+        assert stored is not None
+        assert isinstance(stored.metadata, dict)
+        assert "source_comments" in stored.metadata
+        assert "source_comments_formatted" in stored.metadata
+        assert stored.metadata["source_diff_refs"] == {
+            "base_sha": "base123",
+            "start_sha": "start123",
+            "head_sha": "head123",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +417,7 @@ class TestGitLabModeRestriction:
 
 
 class TestDuplicateCheckModeSpecific:
-    """Duplicate check now uses mode-specific task_type."""
+    """Multiple reviews for the same PR are allowed regardless of mode."""
 
     def test_different_modes_for_same_pr_allowed(self, tmp_path: Path):
         """Two different modes for the same PR number should not conflict."""
@@ -397,8 +441,9 @@ class TestDuplicateCheckModeSpecific:
         assert t1 is not None and t2 is not None
         assert t1.task_type != t2.task_type
 
-    def test_same_mode_same_pr_returns_409(self, tmp_path: Path):
-        client, _ = _client_and_container(tmp_path)
+    def test_same_mode_same_pr_allows_multiple(self, tmp_path: Path):
+        """Multiple reviews with the same mode for the same PR are now allowed."""
+        client, container = _client_and_container(tmp_path)
 
         with (
             patch("overdrive.runtime.api.routes_tasks.shutil.which", return_value="/usr/bin/gh"),
@@ -408,7 +453,12 @@ class TestDuplicateCheckModeSpecific:
             assert resp1.status_code == 200
 
             resp2 = client.post("/api/pull-requests/42/review", json={"review_mode": "fix_only"})
-            assert resp2.status_code == 409
+            assert resp2.status_code == 200
+
+        t1 = container.tasks.get(resp1.json()["task"]["id"])
+        t2 = container.tasks.get(resp2.json()["task"]["id"])
+        assert t1 is not None and t2 is not None
+        assert t1.id != t2.id
 
 
 # ---------------------------------------------------------------------------

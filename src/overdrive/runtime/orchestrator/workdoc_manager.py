@@ -35,13 +35,13 @@ class WorkdocManager:
         "verify": ("## Verification Results", "verify"),
         "benchmark": ("## Verification Results", "verify"),
         "report": ("## Final Report", "report"),
-        # PR review pipelines
-        "fetch_comments": ("## Fetched Comments", "fetch_comments"),
-        "pr_review_comment": ("## Review Comments", "pr_review_comment"),
-        "pr_review_summarize": ("## Review Summary", "pr_review_summarize"),
-        "pr_review_fix_respond": ("## Review & Fix Plan", "pr_review_fix_respond"),
-        "post_comments": ("## Posted Comments", "post_comments"),
-        "post_comment_responses": ("## Comment Responses", "post_comment_responses"),
+        # PR/MR review pipelines use human-readable placeholder text.
+        "fetch_comments": ("## Fetched Comments", "fetch comments"),
+        "pr_review_comment": ("## Review Comments", "review & comment"),
+        "pr_review_summarize": ("## Review Summary", "summarize"),
+        "pr_review_fix_respond": ("## Review & Fix Plan", "review & plan fixes"),
+        "post_comments": ("## Posted Comments", "post comments"),
+        "post_comment_responses": ("## Comment Responses", "post comment responses"),
     }
     _WORKDOC_SENTINEL_ID_MAP: dict[str, str] = {
         "plan": "plan",
@@ -776,9 +776,12 @@ _Pending: will be populated by the generate_tasks step._
             "pr_review": self._COMMIT_REVIEW_WORKDOC_TEMPLATE,
             "mr_review": self._COMMIT_REVIEW_WORKDOC_TEMPLATE,
             "pr_review_comment": self._PR_REVIEW_COMMENT_WORKDOC_TEMPLATE,
+            "mr_review_comment": self._PR_REVIEW_COMMENT_WORKDOC_TEMPLATE,
             "pr_review_summarize": self._PR_REVIEW_SUMMARIZE_WORKDOC_TEMPLATE,
+            "mr_review_summarize": self._PR_REVIEW_SUMMARIZE_WORKDOC_TEMPLATE,
             "pr_review_fix_only": self._COMMIT_REVIEW_WORKDOC_TEMPLATE,
             "pr_review_fix_respond": self._PR_REVIEW_FIX_RESPOND_WORKDOC_TEMPLATE,
+            "mr_review_fix_respond": self._PR_REVIEW_FIX_RESPOND_WORKDOC_TEMPLATE,
             "performance": self._PERFORMANCE_WORKDOC_TEMPLATE,
             "hotfix": self._HOTFIX_WORKDOC_TEMPLATE,
             "spike": self._SPIKE_WORKDOC_TEMPLATE,

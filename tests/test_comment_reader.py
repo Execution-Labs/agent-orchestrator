@@ -346,6 +346,138 @@ class TestFetchMrCommentsBasic:
         assert inline.line == 42
         assert inline.resolved is True
 
+    def test_discussion_ids_are_attached_when_discussions_endpoint_available(self) -> None:
+        notes_fixture = json.dumps([
+            {
+                "id": 401,
+                "body": "Please rename this",
+                "author": {"username": "reviewer1"},
+                "created_at": "2026-03-10T10:00:00.000Z",
+                "system": False,
+                "resolved": False,
+                "position": None,
+            }
+        ])
+        discussions_fixture = json.dumps([
+            {
+                "id": "discussion-abc",
+                "notes": [
+                    {
+                        "id": 401,
+                        "body": "Please rename this",
+                        "author": {"username": "reviewer1"},
+                    }
+                ],
+            }
+        ])
+
+        def side_effect(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            endpoint = cmd[3]
+            if endpoint.endswith("/notes"):
+                return subprocess.CompletedProcess(cmd, 0, stdout=notes_fixture, stderr="")
+            if endpoint.endswith("/discussions"):
+                return subprocess.CompletedProcess(cmd, 0, stdout=discussions_fixture, stderr="")
+            raise AssertionError(f"Unexpected endpoint: {endpoint}")
+
+        with (
+            patch("overdrive.comments.reader.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.comments.reader.subprocess.run", side_effect=side_effect),
+        ):
+            comments = fetch_mr_comments("123", 1)
+
+        assert len(comments) == 1
+        assert comments[0].platform_id == "401"
+        assert comments[0].discussion_id == "discussion-abc"
+
+    def test_discussion_diff_notes_are_included_even_when_notes_endpoint_is_empty(self) -> None:
+        notes_fixture = "[]"
+        discussions_fixture = json.dumps([
+            {
+                "id": "discussion-diff-1",
+                "notes": [
+                    {
+                        "id": 501,
+                        "body": "Inline diff feedback",
+                        "author": {"username": "reviewer2"},
+                        "created_at": "2026-03-10T11:00:00.000Z",
+                        "system": False,
+                        "resolved": True,
+                        "position": {
+                            "new_path": "src/auth.py",
+                            "new_line": 27,
+                        },
+                    }
+                ],
+            }
+        ])
+
+        def side_effect(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            endpoint = cmd[3]
+            if endpoint.endswith("/notes"):
+                return subprocess.CompletedProcess(cmd, 0, stdout=notes_fixture, stderr="")
+            if endpoint.endswith("/discussions"):
+                return subprocess.CompletedProcess(cmd, 0, stdout=discussions_fixture, stderr="")
+            raise AssertionError(f"Unexpected endpoint: {endpoint}")
+
+        with (
+            patch("overdrive.comments.reader.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.comments.reader.subprocess.run", side_effect=side_effect),
+        ):
+            comments = fetch_mr_comments("123", 1)
+
+        assert len(comments) == 1
+        assert comments[0].platform_id == "501"
+        assert comments[0].discussion_id == "discussion-diff-1"
+        assert comments[0].path == "src/auth.py"
+        assert comments[0].line == 27
+
+    def test_discussion_replies_preserve_thread_root(self) -> None:
+        discussions_fixture = json.dumps([
+            {
+                "id": "discussion-thread-1",
+                "notes": [
+                    {
+                        "id": 601,
+                        "body": "Root",
+                        "author": {"username": "reviewer1"},
+                        "created_at": "2026-03-10T10:00:00.000Z",
+                        "system": False,
+                        "resolved": False,
+                        "position": None,
+                    },
+                    {
+                        "id": 602,
+                        "body": "Reply",
+                        "author": {"username": "author1"},
+                        "created_at": "2026-03-10T10:05:00.000Z",
+                        "system": False,
+                        "resolved": False,
+                        "position": None,
+                    },
+                ],
+            }
+        ])
+
+        def side_effect(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            endpoint = cmd[3]
+            if endpoint.endswith("/discussions"):
+                return subprocess.CompletedProcess(cmd, 0, stdout=discussions_fixture, stderr="")
+            if endpoint.endswith("/notes"):
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+            raise AssertionError(f"Unexpected endpoint: {endpoint}")
+
+        with (
+            patch("overdrive.comments.reader.shutil.which", return_value="/usr/bin/glab"),
+            patch("overdrive.comments.reader.subprocess.run", side_effect=side_effect),
+        ):
+            comments = fetch_mr_comments("123", 1)
+
+        assert len(comments) == 2
+        assert comments[0].platform_id == "601"
+        assert comments[0].in_reply_to is None
+        assert comments[1].platform_id == "602"
+        assert comments[1].in_reply_to == "601"
+
 
 class TestFetchMrCommentsInlineFallback:
     def test_falls_back_to_old_path_and_old_line(self) -> None:

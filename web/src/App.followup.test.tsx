@@ -170,7 +170,7 @@ describe('Generate Follow-Up Tasks', () => {
     fireEvent.click(screen.getByText('Feature task'))
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /^Delete$/i })).toBeInTheDocument()
+      expect(screen.getAllByText('Feature task').length).toBeGreaterThan(1)
     })
 
     expect(screen.queryByRole('button', { name: /Generate Follow-Up Tasks/i })).not.toBeInTheDocument()
@@ -187,7 +187,7 @@ describe('Generate Follow-Up Tasks', () => {
     fireEvent.click(screen.getByText('Research with children'))
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /^Delete$/i })).toBeInTheDocument()
+      expect(screen.getAllByText('Research with children').length).toBeGreaterThan(1)
     })
 
     expect(screen.queryByRole('button', { name: /Generate Follow-Up Tasks/i })).not.toBeInTheDocument()

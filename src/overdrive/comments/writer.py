@@ -24,6 +24,11 @@ _GITHUB_PR_RE = re.compile(
 _GITLAB_MR_RE = re.compile(
     r"https?://[^/]+/(?P<project>.+?)/-/merge_requests/(?P<number>\d+)"
 )
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+_HUNK_RE = re.compile(
+    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
+)
+_TRUNCATED_DIFF_NOTICE = "[DIFF TRUNCATED"
 
 
 def parse_source_url(url: str) -> dict[str, Any]:
@@ -122,6 +127,7 @@ def _run_glab_api_post(
             [
                 "glab", "api",
                 "-X", "POST",
+                "-H", "Content-Type: application/json",
                 "--input", "-",
                 endpoint,
             ],
@@ -139,6 +145,256 @@ def _run_glab_api_post(
         return False, "glab api POST timed out"
     except OSError as exc:
         return False, f"glab api POST OS error: {exc}"
+
+
+def _get_gitlab_mr_info(
+    project_id: str,
+    mr_number: int,
+    *,
+    cwd: Path | None = None,
+) -> dict[str, Any] | None:
+    """Fetch metadata for a GitLab merge request (SHA, diff refs, etc.)."""
+    endpoint = f"projects/{project_id}/merge_requests/{mr_number}"
+    try:
+        result = subprocess.run(
+            ["glab", "api", endpoint, "-X", "GET"],
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+        data = json.loads(result.stdout or "{}")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _get_gitlab_mr_head_sha(
+    project_id: str,
+    mr_number: int,
+    *,
+    cwd: Path | None = None,
+) -> str | None:
+    """Fetch the current HEAD SHA for a GitLab merge request."""
+    data = _get_gitlab_mr_info(project_id, mr_number, cwd=cwd)
+    if data is None:
+        return None
+    sha = str(data.get("sha") or "").strip()
+    if sha:
+        return sha
+    diff_refs = data.get("diff_refs")
+    if isinstance(diff_refs, dict):
+        head_sha = str(diff_refs.get("head_sha") or "").strip()
+        if head_sha:
+            return head_sha
+    return None
+
+
+def _get_gitlab_mr_diff_refs(
+    project_id: str,
+    mr_number: int,
+    *,
+    cwd: Path | None = None,
+) -> dict[str, str] | None:
+    """Fetch the current diff refs for a GitLab merge request."""
+    data = _get_gitlab_mr_info(project_id, mr_number, cwd=cwd)
+    if data is None:
+        return None
+    diff_refs = data.get("diff_refs")
+    if not isinstance(diff_refs, dict):
+        return None
+    base_sha = str(diff_refs.get("base_sha") or "").strip()
+    start_sha = str(diff_refs.get("start_sha") or "").strip()
+    head_sha = str(diff_refs.get("head_sha") or "").strip()
+    if not base_sha or not start_sha or not head_sha:
+        return None
+    return {
+        "base_sha": base_sha,
+        "start_sha": start_sha,
+        "head_sha": head_sha,
+    }
+
+
+def _get_gitlab_mr_diff(
+    mr_number: int,
+    *,
+    cwd: Path | None = None,
+) -> str | None:
+    """Fetch the full GitLab merge request diff for inline position resolution."""
+    try:
+        result = subprocess.run(
+            ["glab", "mr", "diff", str(mr_number)],
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    diff_text = str(result.stdout or "")
+    return diff_text if diff_text.strip() else None
+
+
+def _normalize_gitlab_diff_refs(diff_refs: dict[str, Any] | None) -> dict[str, str] | None:
+    """Validate and normalize GitLab diff refs required for inline comments."""
+    if not isinstance(diff_refs, dict):
+        return None
+    base_sha = str(diff_refs.get("base_sha") or "").strip()
+    start_sha = str(diff_refs.get("start_sha") or "").strip()
+    head_sha = str(diff_refs.get("head_sha") or "").strip()
+    if not base_sha or not start_sha or not head_sha:
+        return None
+    return {
+        "base_sha": base_sha,
+        "start_sha": start_sha,
+        "head_sha": head_sha,
+    }
+
+
+def _is_truncated_diff(diff_text: str | None) -> bool:
+    """Report whether the stored diff includes the truncation sentinel."""
+    return _TRUNCATED_DIFF_NOTICE in str(diff_text or "")
+
+
+def _resolve_gitlab_diff_position(
+    *,
+    path: str | None,
+    line: int | None,
+    source_diff: str | None,
+    diff_refs: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Resolve a GitLab MR diff position payload from a unified diff anchor."""
+    normalized_path = str(path or "").strip()
+    if not normalized_path or line is None or line <= 0:
+        return None
+    normalized_refs = _normalize_gitlab_diff_refs(diff_refs)
+    if normalized_refs is None:
+        return None
+    diff_text = str(source_diff or "")
+    if not diff_text.strip():
+        return None
+
+    current_old_path: str | None = None
+    current_new_path: str | None = None
+    old_line_no: int | None = None
+    new_line_no: int | None = None
+    in_hunk = False
+    candidates: list[tuple[int, dict[str, Any]]] = []
+
+    for raw_line in diff_text.splitlines():
+        match = _DIFF_GIT_RE.match(raw_line)
+        if match:
+            current_old_path = match.group(1)
+            current_new_path = match.group(2)
+            old_line_no = None
+            new_line_no = None
+            in_hunk = False
+            continue
+
+        if raw_line.startswith("--- "):
+            in_hunk = False
+            old_line_no = None
+            new_line_no = None
+            raw_old_path = raw_line[4:].strip()
+            if raw_old_path == "/dev/null":
+                current_old_path = None
+            elif raw_old_path.startswith("a/"):
+                current_old_path = raw_old_path[2:]
+            else:
+                current_old_path = raw_old_path
+            continue
+
+        if raw_line.startswith("+++ "):
+            in_hunk = False
+            old_line_no = None
+            new_line_no = None
+            raw_new_path = raw_line[4:].strip()
+            if raw_new_path == "/dev/null":
+                current_new_path = None
+            elif raw_new_path.startswith("b/"):
+                current_new_path = raw_new_path[2:]
+            else:
+                current_new_path = raw_new_path
+            continue
+
+        hunk_match = _HUNK_RE.match(raw_line)
+        if hunk_match:
+            old_line_no = int(hunk_match.group("old_start"))
+            new_line_no = int(hunk_match.group("new_start"))
+            in_hunk = True
+            continue
+
+        if not in_hunk:
+            continue
+        if raw_line.startswith("\\ No newline at end of file"):
+            continue
+
+        line_type = raw_line[:1]
+        if line_type == "+" and not raw_line.startswith("+++"):
+            entry_old_line = None
+            entry_new_line = new_line_no
+            if new_line_no is not None:
+                new_line_no += 1
+        elif line_type == "-" and not raw_line.startswith("---"):
+            entry_old_line = old_line_no
+            entry_new_line = None
+            if old_line_no is not None:
+                old_line_no += 1
+        else:
+            entry_old_line = old_line_no
+            entry_new_line = new_line_no
+            if old_line_no is not None:
+                old_line_no += 1
+            if new_line_no is not None:
+                new_line_no += 1
+
+        if current_new_path == normalized_path and entry_new_line == line:
+            score = 3 if entry_old_line is None else 2
+            candidates.append(
+                (
+                    score,
+                    {
+                        "old_path": current_old_path or normalized_path,
+                        "new_path": current_new_path or normalized_path,
+                        "old_line": entry_old_line,
+                        "new_line": entry_new_line,
+                    },
+                )
+            )
+        if current_old_path == normalized_path and entry_old_line == line:
+            score = 3 if entry_new_line is None else 2
+            candidates.append(
+                (
+                    score,
+                    {
+                        "old_path": current_old_path or normalized_path,
+                        "new_path": current_new_path or normalized_path,
+                        "old_line": entry_old_line,
+                        "new_line": entry_new_line,
+                    },
+                )
+            )
+
+    if not candidates:
+        return None
+    _, chosen = max(candidates, key=lambda item: item[0])
+    position: dict[str, Any] = {
+        "position_type": "text",
+        "base_sha": normalized_refs["base_sha"],
+        "start_sha": normalized_refs["start_sha"],
+        "head_sha": normalized_refs["head_sha"],
+        "old_path": chosen["old_path"],
+        "new_path": chosen["new_path"],
+    }
+    if chosen["old_line"] is not None:
+        position["old_line"] = chosen["old_line"]
+    if chosen["new_line"] is not None:
+        position["new_line"] = chosen["new_line"]
+    return position
 
 
 def _extract_id_from_response(response: str) -> str:
@@ -278,9 +534,11 @@ def post_mr_comment(
     *,
     path: str | None = None,
     line: int | None = None,
+    position: dict[str, Any] | None = None,
     body: str,
     cwd: Path | None = None,
     in_reply_to: int | None = None,
+    discussion_id: str | None = None,
 ) -> CommentPostResult:
     """Post a comment to a GitLab merge request.
 
@@ -293,22 +551,30 @@ def post_mr_comment(
         mr_number: Merge request IID.
         path: File path for inline comments.
         line: Line number for inline comments.
+        position: Fully resolved GitLab diff position payload for inline comments.
         body: Comment body text.
         cwd: Working directory for ``glab`` CLI context.
         in_reply_to: Platform ID of note to reply to.
+        discussion_id: GitLab discussion ID for threaded replies.
 
     Returns:
         :class:`CommentPostResult` indicating success or failure.
     """
     base = f"projects/{project_id}/merge_requests/{mr_number}"
 
-    if in_reply_to is not None:
-        # Post as a top-level note quoting the original (GitLab's discussion
-        # reply API requires the discussion ID, not the note ID; we don't have
-        # the discussion ID readily available, so we post a new note referencing
-        # the original).
-        endpoint = f"{base}/notes"
+    if discussion_id:
+        endpoint = f"{base}/discussions/{discussion_id}/notes"
         payload: dict[str, Any] = {"body": body}
+    elif in_reply_to is not None:
+        # Fallback when only the original note ID is available.
+        endpoint = f"{base}/notes"
+        payload = {"body": body}
+    elif position is not None:
+        endpoint = f"{base}/discussions"
+        payload = {
+            "body": body,
+            "position": position,
+        }
     elif path is not None and line is not None:
         # Inline comment via discussions endpoint.
         endpoint = f"{base}/discussions"
@@ -342,10 +608,12 @@ def post_mr_review_decision(
     body: str,
     cwd: Path | None = None,
 ) -> CommentPostResult:
-    """Post a review decision as a formatted note on a GitLab merge request.
+    """Post a native review decision on a GitLab merge request.
 
-    GitLab has no native review decision API, so the decision is posted as a
-    formatted note (e.g. ``[APPROVED] body``).
+    GitLab exposes merge request review state through quick actions in notes.
+    We use that path instead of synthetic ``[APPROVED]``-style notes so the
+    merge request reflects real approval / requested-changes / reviewed state
+    while still preserving the generated summary text in a single post.
 
     Args:
         project_id: URL-encoded GitLab project path or numeric ID.
@@ -357,18 +625,41 @@ def post_mr_review_decision(
     Returns:
         :class:`CommentPostResult` indicating success or failure.
     """
-    label = decision.upper().replace("_", " ")
-    formatted_body = f"[{label}] {body}" if body else f"[{label}]"
+    if decision == "approve":
+        payload: dict[str, Any] = {}
+        sha = _get_gitlab_mr_head_sha(project_id, mr_number, cwd=cwd)
+        if sha:
+            payload["sha"] = sha
+        approve_endpoint = f"projects/{project_id}/merge_requests/{mr_number}/approve"
+        ok, response = _run_glab_api_post(approve_endpoint, payload, cwd)
+        if not ok:
+            return CommentPostResult(success=False, error=response)
+        if not body.strip():
+            return CommentPostResult(success=True)
+
+        note_ok, note_response = _run_glab_api_post(
+            f"projects/{project_id}/merge_requests/{mr_number}/notes",
+            {"body": body},
+            cwd,
+        )
+        return CommentPostResult(
+            success=note_ok,
+            platform_id=_extract_id_from_response(note_response) if note_ok else "",
+            error=note_response if not note_ok else None,
+        )
+
+    # Post the review body as a plain note without GitLab quick actions.
+    # Previously we appended /submit_review quick actions here, but those
+    # auto-resolve all discussion threads the posting user participated in,
+    # silently dismissing existing unresolved feedback.
+    if not body.strip():
+        return CommentPostResult(success=True)
     endpoint = f"projects/{project_id}/merge_requests/{mr_number}/notes"
-    payload: dict[str, Any] = {"body": formatted_body}
+    payload = {"body": body}
 
     ok, response = _run_glab_api_post(endpoint, payload, cwd)
     platform_id = _extract_id_from_response(response) if ok else ""
-    return CommentPostResult(
-        success=ok,
-        platform_id=platform_id,
-        error=response if not ok else None,
-    )
+    return CommentPostResult(success=ok, platform_id=platform_id, error=response if not ok else None)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +673,8 @@ def post_comments_batch(
     *,
     git_dir: Path,
     commit_id: str | None = None,
+    source_diff: str | None = None,
+    gitlab_diff_refs: dict[str, Any] | None = None,
 ) -> list[CommentPostResult]:
     """Post multiple comments, inserting a brief delay between calls.
 
@@ -391,12 +684,18 @@ def post_comments_batch(
             optionally ``in_reply_to``.
         git_dir: Local git directory for CLI context.
         commit_id: Optional commit SHA for inline comments.
+        source_diff: Unified diff text used to resolve GitLab inline positions.
+        gitlab_diff_refs: GitLab MR diff refs containing base/start/head SHAs.
 
     Returns:
         List of :class:`CommentPostResult` in the same order as *comments*.
     """
     results: list[CommentPostResult] = []
     platform = str(platform_info.get("platform", ""))
+    resolved_gitlab_diff_refs = _normalize_gitlab_diff_refs(gitlab_diff_refs)
+    attempted_gitlab_diff_ref_lookup = False
+    resolved_source_diff = str(source_diff or "")
+    attempted_gitlab_diff_lookup = False
 
     for i, comment in enumerate(comments):
         if i > 0:
@@ -405,9 +704,18 @@ def post_comments_batch(
         body = str(comment.get("body") or "")
         path = comment.get("path")
         raw_line = comment.get("line")
-        line = int(raw_line) if raw_line is not None and int(raw_line) > 0 else None
+        try:
+            line = int(raw_line) if raw_line is not None else None
+            if line is not None and line <= 0:
+                line = None
+        except (ValueError, TypeError):
+            line = None
         raw_reply = comment.get("in_reply_to")
-        in_reply_to = int(raw_reply) if raw_reply is not None else None
+        try:
+            in_reply_to = int(raw_reply) if raw_reply is not None else None
+        except (ValueError, TypeError):
+            in_reply_to = None
+        discussion_id = str(comment.get("discussion_id") or "").strip() or None
 
         # Inline comment requires a valid line; skip if path is set but line
         # is missing/zero (the LLM failed to resolve a diff line number).
@@ -431,14 +739,57 @@ def post_comments_batch(
                 in_reply_to=in_reply_to,
             )
         elif platform == "gitlab":
+            position: dict[str, Any] | None = None
+            if path is not None and line is not None and in_reply_to is None:
+                if resolved_gitlab_diff_refs is None and not attempted_gitlab_diff_ref_lookup:
+                    attempted_gitlab_diff_ref_lookup = True
+                    resolved_gitlab_diff_refs = _get_gitlab_mr_diff_refs(
+                        str(platform_info["project_id"]),
+                        int(platform_info["number"]),
+                        cwd=git_dir,
+                    )
+                position = _resolve_gitlab_diff_position(
+                    path=str(path),
+                    line=line,
+                    source_diff=resolved_source_diff,
+                    diff_refs=resolved_gitlab_diff_refs,
+                )
+                if (
+                    position is None
+                    and not attempted_gitlab_diff_lookup
+                    and (_is_truncated_diff(resolved_source_diff) or not resolved_source_diff.strip())
+                ):
+                    attempted_gitlab_diff_lookup = True
+                    live_diff = _get_gitlab_mr_diff(
+                        int(platform_info["number"]),
+                        cwd=git_dir,
+                    )
+                    if live_diff:
+                        resolved_source_diff = live_diff
+                        position = _resolve_gitlab_diff_position(
+                            path=str(path),
+                            line=line,
+                            source_diff=resolved_source_diff,
+                            diff_refs=resolved_gitlab_diff_refs,
+                        )
+                if position is None:
+                    results.append(
+                        CommentPostResult(
+                            success=False,
+                            error=f"Skipped: could not resolve GitLab diff position for {path}:{line}",
+                        )
+                    )
+                    continue
             result = post_mr_comment(
                 str(platform_info["project_id"]),
                 int(platform_info["number"]),
                 path=str(path) if path is not None else None,
                 line=line,
+                position=position,
                 body=body,
                 cwd=git_dir,
                 in_reply_to=in_reply_to,
+                discussion_id=discussion_id,
             )
         else:
             result = CommentPostResult(success=False, error=f"Unsupported platform: {platform}")
